@@ -1,0 +1,37 @@
+# Illustrative technique for the simulated "fake" platform, shaped like
+# okta.defense-impairment.network-zone-deactivate. The second step modifies
+# the object the first created, so cleanup restores the journalled prior
+# value before deleting the zone.
+id: fake.defense-impairment.network-zone-deactivate
+name: Deactivate a network zone
+description: >
+  Attackers deactivate network zones that block anonymising proxies so their
+  sign-ins stop being challenged. This creates a run-owned zone, deactivates
+  it, and expects both changes in the audit log.
+author: [saashound-maintainers]
+platform: fake
+attack: [T1562]
+tradecraft:
+  - title: "Okta: phishing kits adapt to the script of callers"
+    url: https://www.okta.com/blog/threat-intelligence/phishing-kits-adapt-to-the-script-of-callers/
+    date: 2026-01-22
+evidence: guidance
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: zone
+    op: fake.zone.create
+    with: {gateway: 203.0.113.0/24}
+  - id: deactivate
+    op: fake.zone.deactivate
+    with: {zone: "{{steps.zone.id}}"}
+expect:
+  - after: zone
+    source: fake.audit
+    match: {eventType: zone.create, "target[].displayName": "{{steps.zone.name}}"}
+  - after: deactivate
+    source: fake.audit
+    match: {eventType: zone.deactivate, "target[].id": "{{steps.zone.id}}"}
+cleanup:
+  order: [deactivate, zone]
+detections:
+  - sigma: null

@@ -1,0 +1,39 @@
+# Illustrative technique for the simulated "fake" platform. It mirrors the
+# shape of okta.persistence.mfa-factor-register so the core loop can be proven
+# without a real tenant.
+id: fake.persistence.mfa-factor-register
+name: Register an additional MFA factor on a user
+description: >
+  An attacker who has talked a help desk into resetting a user's MFA enrolls a
+  factor they control, giving them durable access to the account. This
+  creates a synthetic user, enrolls a TOTP factor on it (the seed is used once
+  to activate it and then discarded), and expects the factor activation in the
+  audit log.
+author: [saashound-maintainers]
+platform: fake
+attack: [T1098.005, T1556.006]
+tradecraft:
+  - title: "Okta: cross-tenant impersonation (help-desk MFA reset, second IdP)"
+    url: https://sec.okta.com/articles/2023/08/cross-tenant-impersonation-prevention-and-detection
+    date: 2023-08-31
+evidence: guidance
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: victim
+    op: fake.user.create
+    with: {display_name: "Synthetic victim ({{run.id}})"}
+  - id: factor
+    op: fake.factor.enroll
+    with: {user: "{{steps.victim.id}}"}
+expect:
+  - after: victim
+    source: fake.audit
+    match: {eventType: user.lifecycle.create, "target[].id": "{{steps.victim.id}}"}
+  - after: factor
+    source: fake.audit
+    match: {eventType: user.mfa.factor.activate, "target[].id": "{{steps.factor.id}}"}
+    deadline: 20s
+cleanup:
+  order: [factor, victim]
+detections:
+  - sigma: null    # illustrative: the simulated platform has no public rules

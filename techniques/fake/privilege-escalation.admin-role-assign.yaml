@@ -1,0 +1,35 @@
+# Illustrative technique for the simulated "fake" platform, shaped like
+# okta.privilege-escalation.admin-role-assign.
+id: fake.privilege-escalation.admin-role-assign
+name: Grant an admin role to a user
+description: >
+  After taking over an account, attackers grant admin roles to other accounts
+  they control. This creates a synthetic user with no usable credential,
+  grants it a read-only admin role, and expects the privilege grant in the
+  audit log.
+author: [saashound-maintainers]
+platform: fake
+attack: [T1098.003]
+tradecraft:
+  - title: "Okta: cross-tenant impersonation (help-desk MFA reset, second IdP)"
+    url: https://sec.okta.com/articles/2023/08/cross-tenant-impersonation-prevention-and-detection
+    date: 2023-08-31
+evidence: guidance
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: victim
+    op: fake.user.create
+  - id: grant
+    op: fake.role.assign
+    with: {user: "{{steps.victim.id}}", role: READ_ONLY_ADMIN}
+expect:
+  - after: victim
+    source: fake.audit
+    match: {eventType: user.lifecycle.create, "target[].alternateId": "{{steps.victim.login}}"}
+  - after: grant
+    source: fake.audit
+    match: {eventType: user.account.privilege.grant, "target[].id": "{{steps.grant.id}}", "target[].displayName": READ_ONLY_ADMIN}
+cleanup:
+  order: [grant, victim]
+detections:
+  - sigma: null
