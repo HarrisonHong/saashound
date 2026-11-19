@@ -4,7 +4,7 @@ Adversary emulation with verified detection for SaaS and identity platforms. Run
 
 Point it at your own org and, technique by technique, it gives a verdict from the platform's own audit log, with proof it left nothing behind: *verified detection, not just detonation*.
 
-> **Status: Okta provider, pre-release.** The platform-agnostic engine - technique corpus and validator, op registry, planner, guardrail gate, write-ahead journal, verified cleanup, telemetry collection and matching, versioned JSON-lines output - now drives a real platform. The **Okta** provider runs documented Okta intrusion techniques against an org you own, cleans up provably, and reads the Okta **System Log** back to confirm the platform logged them. The built-in **simulated platform** (`fake`) still exercises the whole loop with no network and no credentials. The **Sigma detection checker** now evaluates a technique's referenced Sigma rules locally, against the run's own events, and reports per rule whether the rule fired - *verified detection, not just detonation*. The GitHub provider and the `exec` (operator-SIEM) checker are the next increments.
+> **Status: Okta and GitHub providers, pre-release.** The platform-agnostic engine - technique corpus and validator, op registry, planner, guardrail gate, write-ahead journal, verified cleanup, telemetry collection and matching, versioned JSON-lines output - now drives two real platforms. The **Okta** provider runs documented Okta intrusion techniques against an org you own, cleans up provably, and reads the Okta **System Log** back to confirm the platform logged them. The **GitHub** provider does the same against a GitHub organization you own, reading the org **audit log** back (GHEC only; on a Free org techniques still detonate and clean up, with telemetry reported unsupported). The built-in **simulated platform** (`fake`) still exercises the whole loop with no network and no credentials. The **Sigma detection checker** now evaluates a technique's referenced Sigma rules locally, against the run's own events, and reports per rule whether the rule fired - *verified detection, not just detonation*. The `exec` (operator-SIEM) checker is the next increment.
 
 ## Authorized use
 
@@ -146,6 +146,54 @@ Everything else - the plan, the guardrail, the verified cleanup, the System Log 
 
 > CI never touches a real org. The provider is proven against an in-process mock Okta ([providers/okta/mockokta](providers/okta/mockokta)) that speaks the same API and System Log; the real-org path is exercised by the operator.
 
+## GitHub quick-start
+
+The GitHub provider runs the same loop against a GitHub **organization** you own. One honest tier line first: the org **audit-log REST API is GitHub Enterprise Cloud (GHEC) only**. On a GHEC org the whole loop works end to end, including the telemetry verdict; on a Free org techniques still **detonate and clean up**, but `saashound auth` reports telemetry `unsupported` and the verdict is `telemetry-unsupported` rather than `pass`. Three one-time steps, as for Okta.
+
+**1. Create an API token.** The tool never mints one. Use a **fine-grained personal access token** (preferred), a GHEC token, or a GitHub App installation token, scoped to this one org and to only what the techniques you run need - equivalent to the classic scopes `repo`, `delete_repo` (so cleanup can delete the run's repositories), `admin:org` (owner promotion), and `read:audit_log` (the audit log on GHEC). Put it in an environment variable or a `0600` file - never a flag:
+
+```sh
+export GITHUB_TOKEN='github_pat_...'   # or a 0600 file referenced with --credential-file
+```
+
+**2. Place the ownership marker.** An org **owner** creates one repository named exactly `saashound-range` (it can be private) and adds a file named `saashound-authorized` at its root whose only contents are the per-target marker value. `init` (next step) prints the exact value; the tool only ever reads this file, so a token alone can never authorise an org.
+
+**3. Declare the target** (allowlist it in `targets.yaml`, which holds the org login and a credential *reference*, never the token):
+
+```console
+$ ./saashound init github --platform github \
+    --tenant your-org \
+    --principal your-login \
+    --credential-env GITHUB_TOKEN
+wrote ~/.config/saashound/targets.yaml  (target github, platform github, environment lab)
+
+Authorize saashound for this tenant (a tenant admin must do this once):
+  Create a repository named exactly  saashound-range  in the organization (it can be private).
+  Add a file named  saashound-authorized  at its root whose only contents are:
+      saashound-authorized:3f1c9a0b7e42
+  ...
+Then: saashound auth github
+```
+
+`--tenant` is the organization **login** (slug), not a URL; `--principal` is the login of the account the token belongs to (what `GET /user` returns). Two techniques act on an operator-owned **second account** (outside-collaborator add and org-owner promotion); point them at it by adding `second_account` to the target's `options` in `targets.yaml`. For GitHub Enterprise **Server**, add the API base the same way:
+
+```yaml
+    options:
+      second_account: your-second-login
+      api_url: https://ghe.example.com/api/v3   # GHES only; github.com needs no api_url
+```
+
+Then verify and run:
+
+```console
+$ ./saashound auth github                # read-only: confirms the org, principal, marker and audit-log tier
+$ ./saashound apply github.persistence.deploy-key-add --target github
+```
+
+Everything else - the plan, the guardrail, the verified cleanup, the audit-log verdict, the JSON lines and exit codes - is the same as for Okta. Webhook payload URLs are always on the reserved `.invalid` TLD, so a creation ping resolves nowhere; deploy keys are added with a freshly generated public key whose private half is discarded, so they authenticate nobody. See the seven shipped GitHub techniques with `saashound list` and `saashound show <id>`.
+
+> CI never touches a real org. The provider is proven against an in-process mock GitHub ([providers/github/mockgithub](providers/github/mockgithub)) that speaks the same REST and audit-log API; the real GHEC path is exercised by the operator.
+
 ## Commands
 
 | Command | What it does |
@@ -192,7 +240,7 @@ In short:
 - **Ops are Go, reversible by construction.** An op ([internal/provider/op.go](internal/provider/op.go)) implements `Do`, `Undo` (its inverse) and `Gone` (proof the inverse worked), plus `Locate` (find a created object by its exact deterministic name after a crash) or `Prior` (read the value a modifying op is about to change, so it is journalled before the change). Registration fails loudly if any of these is missing.
 - **Write-ahead journal, verified cleanup.** The executor ([internal/engine](internal/engine)) writes and fsyncs an intent before every call and the result after it. Cleanup is a pure function of the journal: undo in reverse, treat "not found" as success, require `Gone`. An intent without a result (the process died mid-call) is resolved by exact-name lookup, never by substring search. Cleanup runs before telemetry collection, so nothing stays open during log latency.
 - **Correlation is exact.** Every request carries the run's User-Agent with its phase; the collector ([internal/telemetry](internal/telemetry)) keeps only events whose recorded User-Agent carries this run's ID, matches expectations against detonation-phase events only, and stops as soon as every expectation is met or its deadline passes. Its own audit-log reads carry the `collect` phase. A run whose telemetry was not collected to the end (an API failure, a Ctrl-C) is never a pass.
-- **The provider boundary is open.** A platform is one package implementing `provider.Provider` ([internal/provider/provider.go](internal/provider/provider.go)): its op vocabulary, an `AuditSource`, and a `Tenant` with `Whoami`, `ReadMarker`, `Capabilities` and `Sweep`. It registers itself from `init()` and is linked by one import line in [providers/all.go](providers/all.go). Nothing in the core switches on platform names: adding Okta changed no core package. [providers/fake](providers/fake) is the reference implementation and [providers/okta](providers/okta) is the first real one (a hand-written `net/http` client - no vendor SDK - with SSWS token auth, 429 back-off, Link-header pagination and strict secret redaction); both pass the same conformance suite in [internal/conformance](internal/conformance).
+- **The provider boundary is open.** A platform is one package implementing `provider.Provider` ([internal/provider/provider.go](internal/provider/provider.go)): its op vocabulary, an `AuditSource`, and a `Tenant` with `Whoami`, `ReadMarker`, `Capabilities` and `Sweep`. It registers itself from `init()` and is linked by one import line in [providers/all.go](providers/all.go). Nothing in the core switches on platform names: adding Okta, then GitHub, changed no core package. [providers/fake](providers/fake) is the reference implementation; [providers/okta](providers/okta) and [providers/github](providers/github) are the real ones (each a hand-written `net/http` client - no vendor SDK - with bearer/SSWS token auth, rate-limit back-off, Link-header pagination and strict secret redaction). All three pass the same conformance suite in [internal/conformance](internal/conformance).
 - **Detection checkers are a seam.** [internal/detect](internal/detect) defines a narrow checker interface; the engine folds each checker's results into the verdict. The **Sigma** checker ([internal/detect/sigma](internal/detect/sigma)) implements it with [`runreveal/sigmalite`](https://github.com/runreveal/sigmalite): it loads the operator's own Sigma rules from a local directory (`--sigma-rules`, never vendored), maps the platform's raw events to the fields the rules key on, and evaluates each referenced rule against the run's detonation-phase events. A rule that is not found is `unknown` and one it cannot evaluate (a Sigma v2 correlation rule, or a rule the evaluator cannot parse) is `unsupported`, never a wrong pass. The `exec` (operator-SIEM) checker is the next increment behind the same seam.
 
 | Package | Role |
@@ -215,7 +263,9 @@ In short:
 | `providers/fake` | The simulated platform. |
 | `providers/okta` | The Okta provider: a hand-written `net/http` client, the System Log audit source, `Whoami`/marker/`Sweep`, and the op vocabulary. |
 | `providers/okta/mockokta` | An in-process mock Okta org (test only; not in the binary) the suites run the real provider against. |
-| `techniques` | The embedded, verified corpus (`fake/` and `okta/`). |
+| `providers/github` | The GitHub provider: a hand-written `net/http` client, the org audit-log source (GHEC only), `Whoami`/marker/`Sweep`, and the op vocabulary. |
+| `providers/github/mockgithub` | An in-process mock GitHub org (test only; not in the binary) the suites run the real provider against. |
+| `techniques` | The embedded, verified corpus (`fake/`, `okta/` and `github/`). |
 
 ## Security of the tool itself
 
@@ -237,9 +287,9 @@ go test ./internal/cli -run Golden -update   # after an intended change to the r
 
 What the suites prove:
 
-- **Op conformance** ([providers/fake/fake_test.go](providers/fake/fake_test.go) and [providers/okta/okta_test.go](providers/okta/okta_test.go), both via [internal/conformance](internal/conformance)): every registered op goes Do, Gone false, Locate (exact name only), Sweep, declared events with the run's User-Agent, Undo, Gone true, Undo again (idempotent), tenant unchanged. The okta ops run against the mock Okta org. The suite itself is tested against deliberately broken providers.
-- **Technique conformance** ([internal/engine/engine_test.go](internal/engine/engine_test.go) for fake; [internal/cli/okta_test.go](internal/cli/okta_test.go) for okta): every embedded technique validates, plans, applies, cleans up verified, observes its System Log telemetry and leaves the tenant byte-identical.
-- **Crash injection**: the run is killed at every point of every step of every technique (after the intent, after the call but before the result, after the result, after undo but before its record, between undo and gone, after gone), and a fresh cleaner, reading only the journal, must recover with nothing orphaned; a second cleanup must change nothing. [internal/cli/crash_unix_test.go](internal/cli/crash_unix_test.go) and [internal/cli/okta_crash_unix_test.go](internal/cli/okta_crash_unix_test.go) do the same with real `SIGKILL`ed processes - the okta one against a mock Okta org in the parent process, which the killed child reaches over TCP.
+- **Op conformance** ([providers/fake/fake_test.go](providers/fake/fake_test.go), [providers/okta/okta_test.go](providers/okta/okta_test.go) and [providers/github/github_test.go](providers/github/github_test.go), all via [internal/conformance](internal/conformance)): every registered op goes Do, Gone false, Locate (exact name only), Sweep, declared events with the run's User-Agent, Undo, Gone true, Undo again (idempotent), tenant unchanged. The okta ops run against the mock Okta org and the github ops against the mock GitHub org. The suite itself is tested against deliberately broken providers.
+- **Technique conformance** ([internal/engine/engine_test.go](internal/engine/engine_test.go) for fake; [internal/cli/okta_test.go](internal/cli/okta_test.go) for okta; [internal/cli/github_test.go](internal/cli/github_test.go) for github): every embedded technique validates, plans, applies, cleans up verified, observes its audit-log telemetry and leaves the tenant byte-identical.
+- **Crash injection**: the run is killed at every point of every step of every technique (after the intent, after the call but before the result, after the result, after undo but before its record, between undo and gone, after gone), and a fresh cleaner, reading only the journal, must recover with nothing orphaned; a second cleanup must change nothing. [internal/cli/crash_unix_test.go](internal/cli/crash_unix_test.go), [internal/cli/okta_crash_unix_test.go](internal/cli/okta_crash_unix_test.go) and [internal/cli/github_crash_unix_test.go](internal/cli/github_crash_unix_test.go) do the same with real `SIGKILL`ed processes - the okta and github ones against a mock org in the parent process, which the killed child reaches over TCP.
 - **Golden output** ([internal/cli/testdata/golden](internal/cli/testdata/golden)): the exact JSON-lines records for passing and failing runs; every key must be documented in [docs/result-schema.md](docs/result-schema.md).
 
 **Adding a technique:** write a YAML file under `techniques/<platform>/` (or test one with `--corpus-dir`), run `saashound validate <file>`, and run it against a lab tenant. **Adding a platform:** create `providers/<name>/` implementing `provider.Provider`, add one import to `providers/all.go`, put techniques in `techniques/<name>/`, and make the provider pass `conformance.Run`.

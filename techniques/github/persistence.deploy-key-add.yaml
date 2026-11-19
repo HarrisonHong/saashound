@@ -1,0 +1,30 @@
+id: github.persistence.deploy-key-add
+name: Add a repository deploy key
+description: >
+  The attacker adds a deploy key to a repository so they keep read (or write)
+  access after their session ends, a persistence step CISA's Shai-Hulud
+  guidance tells defenders to audit alongside apps and webhooks. This creates a
+  run-owned repository and adds a read-only deploy key whose private half is
+  generated and discarded, so the key authenticates nobody. Cleanup deletes the
+  key and the repository.
+author: [saashound-maintainers]
+platform: github
+attack: [T1098.004]
+tradecraft:
+  - title: "CISA: Widespread Supply Chain Compromise Impacting npm Ecosystem (Shai-Hulud)"
+    url: https://www.cisa.gov/news-events/alerts/2025/09/23/widespread-supply-chain-compromise-impacting-npm-ecosystem
+    date: 2025-09-23
+evidence: incident
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: repo
+    op: github.repo.create
+  - id: key
+    op: github.deploy_key.add
+    with: {repo: "{{steps.repo.id}}"}
+expect:
+  - after: key
+    source: github.audit_log
+    match: {action: public_key.create, repo_id: "{{steps.repo.repo_id}}"}
+cleanup:
+  order: [key, repo]

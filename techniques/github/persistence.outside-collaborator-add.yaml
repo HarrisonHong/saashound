@@ -1,0 +1,28 @@
+id: github.persistence.outside-collaborator-add
+name: Add an outside collaborator to a repository
+description: >
+  The attacker grants an account they control access to a repository as an
+  outside collaborator, a quiet persistence foothold. This creates a run-owned
+  repository and adds the operator's own second account (the target's
+  second_account option) as a collaborator; cleanup removes the collaborator
+  and the repository. It ships flagged evidence rules-only: SigmaHQ's "Github
+  Outside Collaborator Detected" rule matches only the removal action, so adding
+  one is expected not to fire it, which is exactly the coverage gap this
+  technique exists to measure.
+author: [saashound-maintainers]
+platform: github
+attack: [T1098]
+evidence: rules-only
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: repo
+    op: github.repo.create
+  - id: collab
+    op: github.repo.add_collaborator
+    with: {repo: "{{steps.repo.id}}"}
+expect:
+  - after: collab
+    source: github.audit_log
+    match: {action: repo.add_member, repo_id: "{{steps.repo.repo_id}}"}
+cleanup:
+  order: [collab, repo]

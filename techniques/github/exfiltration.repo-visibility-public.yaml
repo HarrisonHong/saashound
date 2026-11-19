@@ -1,0 +1,30 @@
+id: github.exfiltration.repo-visibility-public
+name: Turn a private repository public
+description: >
+  The attacker flips a private repository to public to exfiltrate its contents,
+  the step Shai-Hulud used to upload stolen credentials to a public repository.
+  This creates a run-owned, auto-initialised private repository (its only
+  contents are the synthetic init commit), briefly makes it public (logged as
+  repo.access), then cleanup restores it to private and deletes it. It runs
+  lab-only.
+author: [saashound-maintainers]
+platform: github
+attack: [T1567]
+tradecraft:
+  - title: "CISA: Widespread Supply Chain Compromise Impacting npm Ecosystem (Shai-Hulud)"
+    url: https://www.cisa.gov/news-events/alerts/2025/09/23/widespread-supply-chain-compromise-impacting-npm-ecosystem
+    date: 2025-09-23
+evidence: incident
+safety: {production_safe: false, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: repo
+    op: github.repo.create
+  - id: publicize
+    op: github.repo.make_public
+    with: {repo: "{{steps.repo.id}}"}
+expect:
+  - after: publicize
+    source: github.audit_log
+    match: {action: repo.access, repo_id: "{{steps.repo.repo_id}}"}
+cleanup:
+  order: [publicize, repo]

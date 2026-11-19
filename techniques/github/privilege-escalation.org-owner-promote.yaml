@@ -1,0 +1,24 @@
+id: github.privilege-escalation.org-owner-promote
+name: Promote an organization member to owner
+description: >
+  The attacker elevates an account they control to organization owner, taking
+  full administrative control of the org. Unlike the other GitHub techniques
+  this one changes a real, operator-owned account's role rather than a
+  run-created object, so it is never production-safe and must be run against a
+  lab org whose second_account option names a disposable member. Cleanup
+  restores the exact role the account held before the run (logged as a second
+  org.update_member).
+author: [saashound-maintainers]
+platform: github
+attack: [T1098.003]
+evidence: rules-only
+safety: {production_safe: false, modifies_existing: true, third_party_contact: none}
+steps:
+  - id: promote
+    op: github.org.promote_owner
+expect:
+  - after: promote
+    source: github.audit_log
+    match: {action: org.update_member, user: "{{steps.promote.id}}"}
+cleanup:
+  order: [promote]

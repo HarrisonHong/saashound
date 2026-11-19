@@ -1,0 +1,29 @@
+id: github.defense-impairment.branch-protection-remove
+name: Remove protection from a protected branch
+description: >
+  The attacker removes branch protection so they can push unreviewed or rewrite
+  history on the default branch. This creates a run-owned repository, protects
+  its default branch (so there is a run-owned protection to remove rather than
+  touching a branch the org relies on), then removes that protection (logged as
+  protected_branch.destroy). Cleanup restores the protection and deletes the
+  repository. It ships flagged evidence rules-only and runs lab-only.
+author: [saashound-maintainers]
+platform: github
+attack: [T1562.001]
+evidence: rules-only
+safety: {production_safe: false, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: repo
+    op: github.repo.create
+  - id: protect
+    op: github.branch_protection.create
+    with: {repo: "{{steps.repo.id}}"}
+  - id: remove
+    op: github.branch.unprotect
+    with: {protection: "{{steps.protect.id}}"}
+expect:
+  - after: remove
+    source: github.audit_log
+    match: {action: protected_branch.destroy, repo_id: "{{steps.repo.repo_id}}"}
+cleanup:
+  order: [remove, protect, repo]

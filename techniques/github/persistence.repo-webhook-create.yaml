@@ -1,0 +1,30 @@
+id: github.persistence.repo-webhook-create
+name: Create a repository webhook to a .invalid endpoint
+description: >
+  The attacker adds a repository webhook so repository events are POSTed to an
+  endpoint they control, a channel GhostAction used to exfiltrate secrets and
+  one CISA's Shai-Hulud guidance tells defenders to audit. This creates a
+  run-owned repository and a webhook whose payload URL is on the reserved
+  .invalid TLD (RFC 6761), so the creation ping, and any later delivery,
+  resolves nowhere. Cleanup deletes the webhook and the repository.
+author: [saashound-maintainers]
+platform: github
+attack: [T1546]
+tradecraft:
+  - title: "CISA: Widespread Supply Chain Compromise Impacting npm Ecosystem (Shai-Hulud)"
+    url: https://www.cisa.gov/news-events/alerts/2025/09/23/widespread-supply-chain-compromise-impacting-npm-ecosystem
+    date: 2025-09-23
+evidence: guidance
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: repo
+    op: github.repo.create
+  - id: hook
+    op: github.webhook.create
+    with: {repo: "{{steps.repo.id}}"}
+expect:
+  - after: hook
+    source: github.audit_log
+    match: {action: hook.create, repo_id: "{{steps.repo.repo_id}}"}
+cleanup:
+  order: [hook, repo]

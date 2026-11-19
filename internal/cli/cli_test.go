@@ -21,6 +21,7 @@ import (
 	"github.com/HarrisonHong/saashound/internal/provider"
 	"github.com/HarrisonHong/saashound/internal/report"
 	"github.com/HarrisonHong/saashound/providers/fake"
+	"github.com/HarrisonHong/saashound/providers/github"
 	"github.com/HarrisonHong/saashound/providers/okta"
 )
 
@@ -63,9 +64,13 @@ func newSandbox(t *testing.T) *sandbox {
 	if err := reg.Register(fake.New(fake.WithStore(store))); err != nil {
 		t.Fatal(err)
 	}
-	// Register okta too so the full embedded corpus (which now includes okta
-	// techniques) validates; these fake-backed tests never open an okta target.
+	// Register okta and github too so the full embedded corpus (which includes
+	// their techniques) validates; these fake-backed tests never open an okta
+	// or github target.
 	if err := reg.Register(okta.New()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(github.New()); err != nil {
 		t.Fatal(err)
 	}
 	return &sandbox{
