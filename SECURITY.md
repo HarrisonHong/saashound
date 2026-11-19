@@ -40,7 +40,7 @@ These are the properties the tool promises (design report, section 7), so a way 
 - **Wrong-object cleanup.** Cleanup or `sweep` touching an object the tool did not create (for example by matching names loosely), or replaying a journal against a different tenant.
 - **Path traversal.** Any file written outside the state directory or an explicit output path.
 - **Listener or remote control.** Anything that makes the tool accept network connections or commands from anywhere but its own command line.
-- **Supply chain.** A dependency or build issue that would put untrusted code in the released binary.
+- **Supply chain.** A dependency or build issue that would put untrusted code in the released binary, or a release artifact that passes the [documented verification](README.md#verify-a-download) without having been built by the release workflow from the tagged source.
 
 ## Out of scope
 

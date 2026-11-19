@@ -25,9 +25,55 @@ Excluded by design. These are not configuration options; the tool has no code fo
 
 Found a vulnerability in SaaSHound itself? See [SECURITY.md](SECURITY.md).
 
+## Install
+
+Every [release](https://github.com/HarrisonHong/saashound/releases) has a `saashound_<version>_<os>_<arch>.tar.gz` for `linux` and `darwin` on `amd64` and `arm64`, and a `saashound_<version>_windows_amd64.zip`, each holding a self-contained binary (no cgo), `LICENSE`, `README.md` and `THIRD_PARTY_LICENSES.txt`. Download, verify and unpack the latest in one line (Linux on x86-64 shown; needs the [GitHub CLI](https://cli.github.com/) 2.49 or later, signed in):
+
+```sh
+gh release download --repo HarrisonHong/saashound --pattern 'saashound_*_linux_amd64.tar.gz' && gh attestation verify saashound_*_linux_amd64.tar.gz --repo HarrisonHong/saashound --signer-workflow HarrisonHong/saashound/.github/workflows/release.yml && tar -xzf saashound_*_linux_amd64.tar.gz saashound
+```
+
+Or build from source with Go 1.26 or later (the Go checksum database authenticates the source):
+
+```sh
+go install github.com/HarrisonHong/saashound/cmd/saashound@latest
+```
+
+### Verify a download
+
+SaaSHound holds a credential that can create a super admin, so check that the binary you run is the one this repository's release workflow built from the tagged source before you give it that credential. Releases are signed and attested keylessly with [Sigstore](https://www.sigstore.dev/), under the release workflow's own GitHub identity. There is no long-lived signing key to steal.
+
+- **Build provenance** ([SLSA](https://slsa.dev/) v1 [artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)) for every archive, SBOM and bare binary. This succeeds only for a file that this repository's `release.yml` built and attested:
+
+  ```sh
+  gh attestation verify saashound_0.1.0_linux_amd64.tar.gz --repo HarrisonHong/saashound --signer-workflow HarrisonHong/saashound/.github/workflows/release.yml
+  ```
+
+  It works on an unpacked or installed binary too: `gh attestation verify "$(command -v saashound)" --repo HarrisonHong/saashound --signer-workflow HarrisonHong/saashound/.github/workflows/release.yml`.
+
+- **A signed `checksums.txt`**, to verify without a GitHub account. Put the release's `checksums.txt` and `checksums.txt.sigstore.json` beside the archive and the release's tag in the identity, then run [cosign](https://docs.sigstore.dev/cosign/system_config/installation/):
+
+  ```sh
+  cosign verify-blob checksums.txt --bundle checksums.txt.sigstore.json --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity https://github.com/HarrisonHong/saashound/.github/workflows/release.yml@refs/tags/v0.1.0 && sha256sum --ignore-missing -c checksums.txt
+  ```
+
+  On macOS, use `shasum -a 256 --ignore-missing -c checksums.txt` for the last step.
+
+- **An SPDX SBOM** per archive (`<archive>.sbom.json`) that lists every module compiled into its binary. Both checks above cover it.
+
+There is deliberately no `saashound verify` command. A binary cannot vouch for itself, because a tampered one would carry a tampered check, so verification belongs to a tool you already trust.
+
+**Reproducible builds.** A release binary depends only on the tagged source, the Go version and the build flags. Run this from a clean clone at the tag, with the Go version that `go version -m saashound` reports for the released binary (`GOTOOLCHAIN=go1.x.y` fetches it):
+
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X github.com/HarrisonHong/saashound/internal/version.Version=v0.1.0" -o saashound ./cmd/saashound
+```
+
+It rebuilds the released binary byte for byte, so `gh attestation verify` accepts your own build too.
+
 ## Quick start
 
-Requires Go 1.26 or later.
+[Install](#install) a release, or build from a clone with Go 1.26 or later:
 
 ```sh
 git clone https://github.com/HarrisonHong/saashound && cd saashound
@@ -274,6 +320,7 @@ In short:
 - **Local state** lives under the state directory in per-run directories (mode `0700`, files `0600`): `plan.json`, `journal.jsonl`, `events.jsonl`, `result.json`. One run per target at a time, enforced with a lock the kernel releases if the process dies.
 - **Architecture tests** ([internal/policy](internal/policy)) fail the build on `os/exec`, `text/template`, `plugin`, `reflect` or `unsafe` anywhere, on network imports outside real provider packages, on any listener, and on reading a raw secret outside a provider transport.
 - **Minimal dependencies:** the standard library, `go.yaml.in/yaml/v3` (the YAML project's maintained successor to `gopkg.in/yaml.v3`), `github.com/spf13/cobra` and `github.com/runreveal/sigmalite` (the Sigma evaluator, which itself pulls in `gopkg.in/yaml.v3`).
+- **Signed, attested, reproducible releases.** Release binaries are built by a workflow that runs only on a version tag and holds no signing key. Each release carries a Sigstore-signed `checksums.txt`, SLSA build provenance for every archive and binary, and an SBOM, and every binary rebuilds byte for byte from the tagged source. See [Verify a download](#verify-a-download).
 
 ## Development
 
@@ -291,6 +338,15 @@ What the suites prove:
 - **Technique conformance** ([internal/engine/engine_test.go](internal/engine/engine_test.go) for fake; [internal/cli/okta_test.go](internal/cli/okta_test.go) for okta; [internal/cli/github_test.go](internal/cli/github_test.go) for github): every embedded technique validates, plans, applies, cleans up verified, observes its audit-log telemetry and leaves the tenant byte-identical.
 - **Crash injection**: the run is killed at every point of every step of every technique (after the intent, after the call but before the result, after the result, after undo but before its record, between undo and gone, after gone), and a fresh cleaner, reading only the journal, must recover with nothing orphaned; a second cleanup must change nothing. [internal/cli/crash_unix_test.go](internal/cli/crash_unix_test.go), [internal/cli/okta_crash_unix_test.go](internal/cli/okta_crash_unix_test.go) and [internal/cli/github_crash_unix_test.go](internal/cli/github_crash_unix_test.go) do the same with real `SIGKILL`ed processes - the okta and github ones against a mock org in the parent process, which the killed child reaches over TCP.
 - **Golden output** ([internal/cli/testdata/golden](internal/cli/testdata/golden)): the exact JSON-lines records for passing and failing runs; every key must be documented in [docs/result-schema.md](docs/result-schema.md).
+
+**Release dry run.** The release build runs in CI on every change, minus signing and publishing; to run it locally:
+
+```sh
+scripts/install-release-tools.sh                   # the pinned goreleaser, syft and cosign, built from source
+goreleaser release --snapshot --clean --skip=sign  # archives, SBOMs and checksums.txt in dist/; nothing signed or published
+```
+
+**Cutting a release:** push a `v*` tag. [.github/workflows/release.yml](.github/workflows/release.yml) builds the release into a draft, signs `checksums.txt`, attests every archive and binary, runs the [verification](#verify-a-download) above against the draft, and publishes it only if that passes. It refuses to run in a private repository, because keyless signing writes the repository and tag to Sigstore's public transparency log.
 
 **Adding a technique:** write a YAML file under `techniques/<platform>/` (or test one with `--corpus-dir`), run `saashound validate <file>`, and run it against a lab tenant. **Adding a platform:** create `providers/<name>/` implementing `provider.Provider`, add one import to `providers/all.go`, put techniques in `techniques/<name>/`, and make the provider pass `conformance.Run`.
 

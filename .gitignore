@@ -35,5 +35,9 @@ go.work.sum
 # Locally built binary
 /saashound
 
+# Release build output (goreleaser) and its generated license bundle
+/dist/
+/build/
+
 # Local workflow notes (kept out of the tree)
 AGENTS.md

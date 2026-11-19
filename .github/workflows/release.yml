@@ -1,0 +1,94 @@
+name: release
+
+# Runs only when a version tag is pushed, never for branch pushes or pull
+# requests. GoReleaser builds the archives and SBOMs, signs checksums.txt
+# keylessly with Sigstore and uploads everything to a draft release; the job
+# then attests every archive and binary, verifies the draft exactly as the
+# README tells users to, and only then publishes it. Signing and attestation
+# use this workflow's OIDC identity: there is no signing key or secret.
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # create the draft release, upload its assets, publish it
+      id-token: write # OIDC token for the Sigstore certificates behind the signature and attestations
+      attestations: write # store the build provenance attestation
+    steps:
+      - name: refuse a private repository
+        if: github.event.repository.private
+        run: |
+          echo "::error::Keyless signing records the repository and tag in the public Sigstore transparency log, and attestations on a private repository need GitHub Enterprise Cloud. Make the repository public before tagging a release."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the changelog needs the previous tag
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true # build with the newest patch release, not whatever the runner has cached
+          cache: false # a release never builds from a restored cache
+
+      - name: install release tools
+        run: scripts/install-release-tools.sh
+
+      - name: build, sign and upload a draft release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: goreleaser release --clean
+
+      - name: list attestation subjects
+        working-directory: dist
+        # Every asset in checksums.txt, plus each platform's bare binary, so an
+        # extracted or installed binary verifies on its own.
+        run: |
+          {
+            cat checksums.txt
+            sha256sum -- saashound_*/saashound*
+          } > "$RUNNER_TEMP/subjects.txt"
+          cat "$RUNNER_TEMP/subjects.txt"
+
+      - name: attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/subjects.txt
+
+      - name: verify the draft as a user would
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir "$RUNNER_TEMP/verify"
+          cd "$RUNNER_TEMP/verify"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY"
+          cosign verify-blob checksums.txt --bundle checksums.txt.sigstore.json \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$TAG"
+          sha256sum -c checksums.txt
+          for f in saashound_*; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          done
+          tar -xzf "saashound_${TAG#v}_linux_amd64.tar.gz" saashound
+          gh attestation verify saashound --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          ./saashound version | grep -F "saashound $TAG ("
+
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

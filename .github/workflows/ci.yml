@@ -58,3 +58,41 @@ jobs:
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      # The release workflow only runs on a tag, so lint is the one place a
+      # mistake in it shows up before a release. actionlint also runs
+      # shellcheck over every `run:` script.
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+  release-dry-run:
+    name: release dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: install release tools
+        run: scripts/install-release-tools.sh
+      - name: goreleaser check
+        run: goreleaser check
+      - name: snapshot release (everything but signing and publishing)
+        run: goreleaser release --snapshot --clean --skip=sign
+      - name: check the artifacts
+        working-directory: dist
+        run: |
+          sha256sum -c checksums.txt
+          version="$(jq -r .version metadata.json)"
+          expect() { # <archive> <listing>
+            got="$(case "$1" in *.zip) unzip -Z1 "$1" ;; *) tar -tzf "$1" ;; esac | LC_ALL=C sort | paste -sd' ')"
+            [ "$got" = "$2" ] || { echo "::error::$1 holds: $got; want: $2"; exit 1; }
+          }
+          for p in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
+            expect "saashound_${version}_$p.tar.gz" "LICENSE README.md THIRD_PARTY_LICENSES.txt saashound"
+          done
+          expect "saashound_${version}_windows_amd64.zip" "LICENSE README.md THIRD_PARTY_LICENSES.txt saashound.exe"
+          ./saashound_linux_amd64_v1/saashound version | grep -F "saashound v$version ("
