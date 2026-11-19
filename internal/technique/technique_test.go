@@ -8,7 +8,9 @@ import (
 
 	"github.com/HarrisonHong/saashound/internal/provider"
 	"github.com/HarrisonHong/saashound/internal/technique"
-	_ "github.com/HarrisonHong/saashound/providers/fake"
+	// Register every provider so the whole embedded corpus (fake and okta)
+	// validates against the real op vocabulary.
+	_ "github.com/HarrisonHong/saashound/providers"
 	"github.com/HarrisonHong/saashound/techniques"
 )
 
@@ -256,7 +258,10 @@ func TestEmbeddedCorpusValidates(t *testing.T) {
 		if !tech.Verified || tech.Digest == "" {
 			t.Errorf("%s: verified=%v digest=%q", tech.ID, tech.Verified, tech.Digest)
 		}
-		if len(tech.Steps) < 2 {
+		// The illustrative fake corpus exercises multi-step techniques; a real
+		// provider may have a legitimately single-step technique (e.g. adding
+		// one identity provider), so the floor applies only to fake.
+		if strings.HasPrefix(tech.ID, "fake.") && len(tech.Steps) < 2 {
 			t.Errorf("%s: the illustrative corpus should exercise multi-step techniques", tech.ID)
 		}
 	}

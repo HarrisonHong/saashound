@@ -21,6 +21,7 @@ import (
 	"github.com/HarrisonHong/saashound/internal/provider"
 	"github.com/HarrisonHong/saashound/internal/report"
 	"github.com/HarrisonHong/saashound/providers/fake"
+	"github.com/HarrisonHong/saashound/providers/okta"
 )
 
 var update = flag.Bool("update", false, "rewrite golden files")
@@ -60,6 +61,11 @@ func newSandbox(t *testing.T) *sandbox {
 	store := &outageStore{MemoryStore: fake.NewMemoryStore()}
 	reg := provider.NewRegistry()
 	if err := reg.Register(fake.New(fake.WithStore(store))); err != nil {
+		t.Fatal(err)
+	}
+	// Register okta too so the full embedded corpus (which now includes okta
+	// techniques) validates; these fake-backed tests never open an okta target.
+	if err := reg.Register(okta.New()); err != nil {
 		t.Fatal(err)
 	}
 	return &sandbox{

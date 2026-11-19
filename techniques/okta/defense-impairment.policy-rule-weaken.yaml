@@ -1,0 +1,33 @@
+id: okta.defense-impairment.policy-rule-weaken
+name: Weaken an authentication policy rule to drop MFA
+description: >
+  The attacker removes the second factor from an authentication policy so their
+  access survives an MFA challenge, a step the 2023 Okta advisory calls out.
+  This creates a run-owned access policy with an MFA-requiring rule, then
+  weakens that rule to one factor (logged as policy.rule.update). Cleanup
+  restores the recorded MFA requirement and deletes the policy and rule, so no
+  real sign-on policy is ever touched.
+author: [saashound-maintainers]
+platform: okta
+attack: [T1556.009]
+tradecraft:
+  - title: "Okta: cross-tenant impersonation prevention and detection"
+    url: https://sec.okta.com/articles/2023/08/cross-tenant-impersonation-prevention-and-detection
+    date: 2023-08-31
+evidence: guidance
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: policy
+    op: okta.policy.create
+  - id: rule
+    op: okta.policy.add_rule
+    with: {policy: "{{steps.policy.id}}"}
+  - id: weaken
+    op: okta.policy.weaken_rule
+    with: {rule: "{{steps.rule.id}}"}
+expect:
+  - after: weaken
+    source: okta.system_log
+    match: {eventType: policy.rule.update, "target[].id": "{{steps.rule.id}}"}
+cleanup:
+  order: [weaken, rule, policy]

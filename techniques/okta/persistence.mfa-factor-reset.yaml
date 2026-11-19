@@ -1,0 +1,37 @@
+id: okta.persistence.mfa-factor-reset
+name: Reset a user's MFA factors
+description: >
+  The help-desk-reset step of the 2023 cross-tenant impersonation playbook: an
+  attacker gets a user's MFA factors reset so they can enrol their own. This
+  creates a synthetic user, enrols a factor on it, then resets that user's
+  factors (logged as user.mfa.factor.reset_all). Cleanup re-enrols an inert
+  replacement factor and removes the synthetic user, so the run leaves nothing
+  behind.
+author: [saashound-maintainers]
+platform: okta
+attack: [T1556.006, T1098.005]
+tradecraft:
+  - title: "Okta: cross-tenant impersonation prevention and detection"
+    url: https://sec.okta.com/articles/2023/08/cross-tenant-impersonation-prevention-and-detection
+    date: 2023-08-31
+evidence: guidance
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: victim
+    op: okta.user.create
+    with: {display_name: "Victim ({{run.id}})"}
+  - id: factor
+    op: okta.factor.enroll_totp
+    with: {user: "{{steps.victim.id}}"}
+  - id: reset
+    op: okta.factor.reset
+    with: {factor: "{{steps.factor.id}}"}
+expect:
+  - after: factor
+    source: okta.system_log
+    match: {eventType: user.mfa.factor.activate, "target[].id": "{{steps.victim.id}}"}
+  - after: reset
+    source: okta.system_log
+    match: {eventType: user.mfa.factor.reset_all, "target[].id": "{{steps.victim.id}}"}
+cleanup:
+  order: [reset, factor, victim]

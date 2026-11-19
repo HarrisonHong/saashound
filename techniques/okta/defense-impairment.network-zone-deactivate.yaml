@@ -1,0 +1,32 @@
+id: okta.defense-impairment.network-zone-deactivate
+name: Deactivate a network zone
+description: >
+  The attacker disables a network zone to remove an IP-based control (for
+  example a deny-list of anonymising proxies that Okta recommends). This creates
+  a run-owned IP zone and deactivates it (logged as zone.deactivate). Cleanup
+  re-activates and deletes the zone, so no real zone is ever changed.
+author: [saashound-maintainers]
+platform: okta
+attack: [T1562.007]
+tradecraft:
+  - title: "Okta: how phishing kits adapt to the script of callers"
+    url: https://www.okta.com/blog/threat-intelligence/phishing-kits-adapt-to-the-script-of-callers/
+    date: 2026-01-22
+evidence: guidance
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: zone
+    op: okta.zone.create
+    with: {gateway: "203.0.113.0/24"}
+  - id: deactivate
+    op: okta.zone.deactivate
+    with: {zone: "{{steps.zone.id}}"}
+expect:
+  - after: zone
+    source: okta.system_log
+    match: {eventType: zone.create, "target[].id": "{{steps.zone.id}}"}
+  - after: deactivate
+    source: okta.system_log
+    match: {eventType: zone.deactivate, "target[].id": "{{steps.zone.id}}"}
+cleanup:
+  order: [deactivate, zone]

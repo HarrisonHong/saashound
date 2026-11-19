@@ -1,0 +1,43 @@
+id: okta.privilege-escalation.custom-admin-role
+name: Grant a user a custom admin role over a resource set
+description: >
+  A quieter variant of a Super Admin grant: the attacker creates a custom admin
+  role and a resource set, then binds the role to a synthetic user over that
+  resource set. This exercises the iam.role.create, iam.resourceset.create and
+  iam.resourceset.bindings.add events. Cleanup removes the binding, the user,
+  the resource set and the role.
+author: [saashound-maintainers]
+platform: okta
+attack: [T1098.003]
+tradecraft:
+  - title: "Okta: cross-tenant impersonation prevention and detection"
+    url: https://sec.okta.com/articles/2023/08/cross-tenant-impersonation-prevention-and-detection
+    date: 2023-08-31
+evidence: guidance
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: role
+    op: okta.iam.create_role
+  - id: rset
+    op: okta.iam.create_resource_set
+  - id: victim
+    op: okta.user.create
+    with: {display_name: "Operator ({{run.id}})"}
+  - id: bind
+    op: okta.iam.bind_role
+    with:
+      resource_set: "{{steps.rset.id}}"
+      role: "{{steps.role.id}}"
+      member: "{{steps.victim.id}}"
+expect:
+  - after: role
+    source: okta.system_log
+    match: {eventType: iam.role.create, "target[].id": "{{steps.role.id}}"}
+  - after: rset
+    source: okta.system_log
+    match: {eventType: iam.resourceset.create, "target[].id": "{{steps.rset.id}}"}
+  - after: bind
+    source: okta.system_log
+    match: {eventType: iam.resourceset.bindings.add, "target[].id": "{{steps.rset.id}}"}
+cleanup:
+  order: [bind, victim, rset, role]

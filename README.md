@@ -4,7 +4,7 @@ Adversary emulation with verified detection for SaaS and identity platforms. Run
 
 Point it at your own org and, technique by technique, it gives a verdict from the platform's own audit log, with proof it left nothing behind: *verified detection, not just detonation*.
 
-> **Status: core engine, pre-release.** This increment is the platform-agnostic engine: technique corpus and validator, op registry, planner, guardrail gate, write-ahead journal, verified cleanup, telemetry collection and matching, versioned JSON-lines output. It runs end to end against a built-in **simulated platform** (`fake`) with no network and no credentials. Okta and GitHub providers, and the Sigma detection checker, are the next increments.
+> **Status: Okta provider, pre-release.** The platform-agnostic engine - technique corpus and validator, op registry, planner, guardrail gate, write-ahead journal, verified cleanup, telemetry collection and matching, versioned JSON-lines output - now drives a real platform. The **Okta** provider runs documented Okta intrusion techniques against an org you own, cleans up provably, and reads the Okta **System Log** back to confirm the platform logged them. The built-in **simulated platform** (`fake`) still exercises the whole loop with no network and no credentials. The GitHub provider and the Sigma detection checker are the next increments.
 
 ## Authorized use
 
@@ -103,6 +103,47 @@ no saashound- objects found in tenant sim-lab
 
 To try the slow paths, add options to the fake target in `targets.yaml`: `api_latency: 2s` (time to press Ctrl-C mid-call), `audit_lag: 5s`, `audit_lag/<eventType>: 40s` (a late event), `audit_drop: <eventType>` (a missing event), `audit: unsupported` (a tier without an audit API).
 
+## Okta quick-start
+
+The Okta provider runs the same loop against a real Okta org you own (a free [Integrator](https://developer.okta.com/) org works). Three one-time steps, then it is identical to the simulated flow above.
+
+**1. Create an org-owned API token.** In the Okta Admin Console, go to **Security → API → Tokens → Create Token**. Okta cannot mint tokens over the API, so the operator supplies one; an SSWS token inherits the privileges of the admin who creates it, so sign in as a **dedicated service account** and give it a **custom admin role** scoped to only what the techniques you run need, rather than Super Admin. (Granting Super Admin to a user, or API scopes to a service app, does need the token's own account to hold Super Admin; those techniques are noted in `saashound show`.) Put the token in an environment variable or a `0600` file - never a flag:
+
+```sh
+export OKTA_TOKEN='00abc...'          # or a 0600 file referenced with --credential-file
+```
+
+**2. Place the ownership marker.** A tenant admin creates one Okta **group** named `saashound-authorized` whose **description** is the per-target marker value. `init` (next step) prints the exact value and where to put it; the tool only ever reads this group, so a token alone can never authorise an org. In the Admin Console: **Directory → Groups → Add group**.
+
+**3. Declare the target** (allowlist it in `targets.yaml`, which holds the tenant URL and a credential *reference*, never the token):
+
+```console
+$ ./saashound init okta --platform okta \
+    --tenant https://your-org.okta.com \
+    --principal you@your-org.example \
+    --test-domain your-test-domain.example \
+    --credential-env OKTA_TOKEN
+wrote ~/.config/saashound/targets.yaml  (target okta, platform okta, environment lab)
+
+Authorize saashound for this tenant (a tenant admin must do this once):
+  In the Okta Admin Console, go to Directory > Groups > Add group.
+  Name the group exactly  saashound-authorized
+  and set its Description to  saashound-authorized:cc8326f4920d
+  ...
+Then: saashound auth okta
+```
+
+`--tenant` is the bare org URL (no trailing slash); `--principal` is the login of the user the token belongs to (what `/api/v1/users/me` returns). Then verify and run:
+
+```console
+$ ./saashound auth okta                 # read-only: confirms the org, principal, marker and System Log
+$ ./saashound apply okta.persistence.mfa-factor-register --target okta
+```
+
+Everything else - the plan, the guardrail, the verified cleanup, the System Log verdict, the JSON lines and exit codes - is the same as for the simulated platform. See the eight shipped techniques with `saashound list` and `saashound show <id>`.
+
+> CI never touches a real org. The provider is proven against an in-process mock Okta ([providers/okta/mockokta](providers/okta/mockokta)) that speaks the same API and System Log; the real-org path is exercised by the operator.
+
 ## Commands
 
 | Command | What it does |
@@ -149,7 +190,7 @@ In short:
 - **Ops are Go, reversible by construction.** An op ([internal/provider/op.go](internal/provider/op.go)) implements `Do`, `Undo` (its inverse) and `Gone` (proof the inverse worked), plus `Locate` (find a created object by its exact deterministic name after a crash) or `Prior` (read the value a modifying op is about to change, so it is journalled before the change). Registration fails loudly if any of these is missing.
 - **Write-ahead journal, verified cleanup.** The executor ([internal/engine](internal/engine)) writes and fsyncs an intent before every call and the result after it. Cleanup is a pure function of the journal: undo in reverse, treat "not found" as success, require `Gone`. An intent without a result (the process died mid-call) is resolved by exact-name lookup, never by substring search. Cleanup runs before telemetry collection, so nothing stays open during log latency.
 - **Correlation is exact.** Every request carries the run's User-Agent with its phase; the collector ([internal/telemetry](internal/telemetry)) keeps only events whose recorded User-Agent carries this run's ID, matches expectations against detonation-phase events only, and stops as soon as every expectation is met or its deadline passes. Its own audit-log reads carry the `collect` phase. A run whose telemetry was not collected to the end (an API failure, a Ctrl-C) is never a pass.
-- **The provider boundary is open.** A platform is one package implementing `provider.Provider` ([internal/provider/provider.go](internal/provider/provider.go)): its op vocabulary, an `AuditSource`, and a `Tenant` with `Whoami`, `ReadMarker`, `Capabilities` and `Sweep`. It registers itself from `init()` and is linked by one import line in [providers/all.go](providers/all.go). Nothing in the core switches on platform names. [providers/fake](providers/fake) is the reference implementation; a provider must pass the conformance suite in [internal/conformance](internal/conformance).
+- **The provider boundary is open.** A platform is one package implementing `provider.Provider` ([internal/provider/provider.go](internal/provider/provider.go)): its op vocabulary, an `AuditSource`, and a `Tenant` with `Whoami`, `ReadMarker`, `Capabilities` and `Sweep`. It registers itself from `init()` and is linked by one import line in [providers/all.go](providers/all.go). Nothing in the core switches on platform names: adding Okta changed no core package. [providers/fake](providers/fake) is the reference implementation and [providers/okta](providers/okta) is the first real one (a hand-written `net/http` client - no vendor SDK - with SSWS token auth, 429 back-off, Link-header pagination and strict secret redaction); both pass the same conformance suite in [internal/conformance](internal/conformance).
 - **Detection checkers are a seam.** [internal/detect](internal/detect) defines the interface the Sigma and `exec` checkers will implement; the engine already folds their results into the verdict.
 
 | Package | Role |
@@ -169,7 +210,9 @@ In short:
 | `internal/secret` | The redacting secret type and credential references. |
 | `internal/target`, `internal/state`, `internal/fsutil`, `internal/clock` | `targets.yaml`, run directories and locks, atomic private files, time. |
 | `providers/fake` | The simulated platform. |
-| `techniques` | The embedded, verified corpus. |
+| `providers/okta` | The Okta provider: a hand-written `net/http` client, the System Log audit source, `Whoami`/marker/`Sweep`, and the op vocabulary. |
+| `providers/okta/mockokta` | An in-process mock Okta org (test only; not in the binary) the suites run the real provider against. |
+| `techniques` | The embedded, verified corpus (`fake/` and `okta/`). |
 
 ## Security of the tool itself
 
@@ -191,9 +234,9 @@ go test ./internal/cli -run Golden -update   # after an intended change to the r
 
 What the suites prove:
 
-- **Op conformance** ([providers/fake/fake_test.go](providers/fake/fake_test.go) via [internal/conformance](internal/conformance)): every registered op goes Do, Gone false, Locate (exact name only), Sweep, declared events with the run's User-Agent, Undo, Gone true, Undo again (idempotent), tenant unchanged. The suite itself is tested against deliberately broken providers.
-- **Technique conformance** ([internal/engine/engine_test.go](internal/engine/engine_test.go)): every embedded technique validates, plans, applies, cleans up verified, observes its telemetry and leaves the tenant byte-identical.
-- **Crash injection**: the run is killed at every point of every step of every technique (after the intent, after the call but before the result, after the result, after undo but before its record, between undo and gone, after gone), and a fresh cleaner, reading only the journal, must recover with nothing orphaned; a second cleanup must change nothing. [internal/cli/crash_unix_test.go](internal/cli/crash_unix_test.go) does the same with real `SIGKILL`ed processes and a file-backed simulated tenant.
+- **Op conformance** ([providers/fake/fake_test.go](providers/fake/fake_test.go) and [providers/okta/okta_test.go](providers/okta/okta_test.go), both via [internal/conformance](internal/conformance)): every registered op goes Do, Gone false, Locate (exact name only), Sweep, declared events with the run's User-Agent, Undo, Gone true, Undo again (idempotent), tenant unchanged. The okta ops run against the mock Okta org. The suite itself is tested against deliberately broken providers.
+- **Technique conformance** ([internal/engine/engine_test.go](internal/engine/engine_test.go) for fake; [internal/cli/okta_test.go](internal/cli/okta_test.go) for okta): every embedded technique validates, plans, applies, cleans up verified, observes its System Log telemetry and leaves the tenant byte-identical.
+- **Crash injection**: the run is killed at every point of every step of every technique (after the intent, after the call but before the result, after the result, after undo but before its record, between undo and gone, after gone), and a fresh cleaner, reading only the journal, must recover with nothing orphaned; a second cleanup must change nothing. [internal/cli/crash_unix_test.go](internal/cli/crash_unix_test.go) and [internal/cli/okta_crash_unix_test.go](internal/cli/okta_crash_unix_test.go) do the same with real `SIGKILL`ed processes - the okta one against a mock Okta org in the parent process, which the killed child reaches over TCP.
 - **Golden output** ([internal/cli/testdata/golden](internal/cli/testdata/golden)): the exact JSON-lines records for passing and failing runs; every key must be documented in [docs/result-schema.md](docs/result-schema.md).
 
 **Adding a technique:** write a YAML file under `techniques/<platform>/` (or test one with `--corpus-dir`), run `saashound validate <file>`, and run it against a lab tenant. **Adding a platform:** create `providers/<name>/` implementing `provider.Provider`, add one import to `providers/all.go`, put techniques in `techniques/<name>/`, and make the provider pass `conformance.Run`.

@@ -1,0 +1,26 @@
+id: okta.persistence.idp-create
+name: Add a second inbound identity provider
+description: >
+  The attacker adds a federated IdP they control so they can impersonate users
+  by signing assertions themselves, a step in the 2023 cross-tenant
+  impersonation campaign. This creates an inbound SAML IdP whose SSO endpoint is
+  on the reserved .invalid TLD (it can never route a real sign-in) and whose
+  signing key is discarded. Cleanup deactivates and deletes it.
+author: [saashound-maintainers]
+platform: okta
+attack: [T1484.002]
+tradecraft:
+  - title: "Okta: cross-tenant impersonation prevention and detection"
+    url: https://sec.okta.com/articles/2023/08/cross-tenant-impersonation-prevention-and-detection
+    date: 2023-08-31
+evidence: guidance
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: idp
+    op: okta.idp.create
+expect:
+  - after: idp
+    source: okta.system_log
+    match: {eventType: system.idp.lifecycle.create, "target[].id": "{{steps.idp.id}}"}
+cleanup:
+  order: [idp]

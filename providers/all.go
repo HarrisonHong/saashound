@@ -5,4 +5,6 @@ package providers
 import (
 	// The simulated platform used by the test suites and `--target <fake>`.
 	_ "github.com/HarrisonHong/saashound/providers/fake"
+	// Okta: the first real platform.
+	_ "github.com/HarrisonHong/saashound/providers/okta"
 )

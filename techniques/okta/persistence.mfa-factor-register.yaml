@@ -1,0 +1,40 @@
+id: okta.persistence.mfa-factor-register
+name: Register an additional MFA factor on a user
+description: >
+  An attacker who has reset or taken over a user's MFA enrols a factor they
+  control, giving durable access to the account. This creates a synthetic user
+  (no password is ever set) and enrols a software TOTP factor on it; the shared
+  secret stays server-side and is never retrieved. It expects the factor
+  activation in the System Log - an event no public Sigma or Elastic rule
+  alerts on today.
+author: [saashound-maintainers]
+platform: okta
+attack: [T1098.005, T1556.006]
+tradecraft:
+  - title: "Okta: how phishing kits adapt to the script of callers"
+    url: https://www.okta.com/blog/threat-intelligence/phishing-kits-adapt-to-the-script-of-callers/
+    date: 2026-01-22
+  - title: "Okta: cross-tenant impersonation prevention and detection"
+    url: https://sec.okta.com/articles/2023/08/cross-tenant-impersonation-prevention-and-detection
+    date: 2023-08-31
+evidence: guidance
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: victim
+    op: okta.user.create
+    with: {display_name: "Victim ({{run.id}})"}
+  - id: factor
+    op: okta.factor.enroll_totp
+    with: {user: "{{steps.victim.id}}"}
+expect:
+  - after: victim
+    source: okta.system_log
+    match: {eventType: user.lifecycle.create, "target[].id": "{{steps.victim.id}}"}
+  - after: factor
+    source: okta.system_log
+    match: {eventType: user.mfa.factor.activate, "target[].id": "{{steps.victim.id}}"}
+cleanup:
+  order: [factor, victim]
+detections:
+  - sigma: null    # no public SigmaHQ rule alerts on user.mfa.factor.activate (2026-11-14)
+  - elastic: null  # Elastic uses it only as an all-clear, not an alert (a published gap)

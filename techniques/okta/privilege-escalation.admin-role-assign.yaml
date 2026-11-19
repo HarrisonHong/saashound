@@ -1,0 +1,30 @@
+id: okta.privilege-escalation.admin-role-assign
+name: Assign a Super Admin role to a user
+description: >
+  After establishing a foothold, the attacker grants broad admin privileges to
+  an account they control. This creates a synthetic user (no usable
+  credential), grants it the SUPER_ADMIN role, and expects the privilege-grant
+  event. Cleanup revokes the role and removes the user. Granting SUPER_ADMIN
+  requires the tool's own token to hold Super Admin.
+author: [saashound-maintainers]
+platform: okta
+attack: [T1098.003]
+tradecraft:
+  - title: "Okta: cross-tenant impersonation prevention and detection"
+    url: https://sec.okta.com/articles/2023/08/cross-tenant-impersonation-prevention-and-detection
+    date: 2023-08-31
+evidence: guidance
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: victim
+    op: okta.user.create
+    with: {display_name: "Operator ({{run.id}})"}
+  - id: grant
+    op: okta.role.assign
+    with: {user: "{{steps.victim.id}}", role: SUPER_ADMIN}
+expect:
+  - after: grant
+    source: okta.system_log
+    match: {eventType: user.account.privilege.grant, "target[].id": "{{steps.victim.id}}"}
+cleanup:
+  order: [grant, victim]

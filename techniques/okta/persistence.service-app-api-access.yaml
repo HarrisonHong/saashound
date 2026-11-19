@@ -1,0 +1,35 @@
+id: okta.persistence.service-app-api-access
+name: Create a service app and grant it API scopes
+description: >
+  The Okta analogue of the Salesloft/Drift (UNC6395) OAuth-integration
+  persistence: the attacker registers an OAuth 2.0 service app and grants it
+  Okta API scopes, giving a long-lived programmatic foothold. This creates the
+  service app (its generated client secret is used once and never journalled)
+  and grants it the okta.users.read scope. Cleanup revokes the scope and
+  deletes the app. No public SigmaHQ rule alerts on any app.oauth2.* event.
+author: [saashound-maintainers]
+platform: okta
+attack: [T1098.001]
+tradecraft:
+  - title: "Google Threat Intelligence: data theft from Salesforce via Salesloft Drift (UNC6395)"
+    url: https://cloud.google.com/blog/topics/threat-intelligence/data-theft-salesforce-instances-via-salesloft-drift
+    date: 2025-08-26
+evidence: incident
+safety: {production_safe: true, modifies_existing: false, third_party_contact: none}
+steps:
+  - id: app
+    op: okta.app.create_oauth
+  - id: grant
+    op: okta.app.grant_scope
+    with: {app: "{{steps.app.id}}", scope: okta.users.read}
+expect:
+  - after: app
+    source: okta.system_log
+    match: {eventType: application.lifecycle.create, "target[].id": "{{steps.app.id}}"}
+  - after: grant
+    source: okta.system_log
+    match: {eventType: app.oauth2.client.privilege.grant, "target[].id": "{{steps.app.id}}"}
+cleanup:
+  order: [grant, app]
+detections:
+  - sigma: null  # no public SigmaHQ rule covers any app.oauth2.* event (2026-11-14)

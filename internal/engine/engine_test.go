@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"testing"
@@ -83,8 +84,15 @@ func newWorld(t *testing.T, opts map[string]string) *world {
 	if err := p.PlaceMarker(context.Background(), cfg, w.tgt.MarkerValue()); err != nil {
 		t.Fatal(err)
 	}
+	// This world runs the fake provider's simulated tenant, so it loads only
+	// the fake corpus; the okta corpus is exercised against the mock Okta
+	// server in the okta and cli test suites.
+	fakeFS, err := fs.Sub(techniques.FS(), fake.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.corpus = technique.NewCorpus(techniques.Version())
-	if err := w.corpus.LoadFS(techniques.FS(), true, technique.RegistryCatalog(reg)); err != nil {
+	if err := w.corpus.LoadFS(fakeFS, true, technique.RegistryCatalog(reg)); err != nil {
 		t.Fatal(err)
 	}
 	return w
