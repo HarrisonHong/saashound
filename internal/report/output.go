@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/HarrisonHong/saashound/internal/detect"
 )
 
 // IsTerminal reports whether f is a character device (a TTY).
@@ -120,13 +122,34 @@ func detectionsCell(r *Record) string {
 	if len(r.Detections) == 0 {
 		return "-"
 	}
-	fired := 0
+	var fired, unknown, unsupported, errc int
 	for _, d := range r.Detections {
-		if d.Fired != nil && *d.Fired {
+		switch {
+		case d.Fired != nil && *d.Fired:
 			fired++
+		case d.Status == detect.StatusUnknown:
+			unknown++
+		case d.Status == detect.StatusUnsupported:
+			unsupported++
+		case d.Status == detect.StatusError:
+			errc++
 		}
 	}
-	return fmt.Sprintf("%d/%d", fired, len(r.Detections))
+	cell := fmt.Sprintf("%d/%d", fired, len(r.Detections))
+	var notes []string
+	if unknown > 0 {
+		notes = append(notes, "unknown")
+	}
+	if unsupported > 0 {
+		notes = append(notes, "unsupported")
+	}
+	if errc > 0 {
+		notes = append(notes, "error")
+	}
+	if len(notes) > 0 {
+		cell += " (" + strings.Join(notes, ",") + ")"
+	}
+	return cell
 }
 
 func cleanupCell(r *Record) string {

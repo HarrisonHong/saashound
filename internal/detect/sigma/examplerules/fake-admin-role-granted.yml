@@ -1,0 +1,25 @@
+# EXAMPLE rule, not a SigmaHQ rule. It ships with SaaSHound only so the Sigma
+# detection checker proves out end to end against the simulated `fake`
+# platform, in tests and under `--target fake`, without a real Sigma rule
+# checkout. Real detections reference the operator's own rules, loaded with
+# --sigma-rules. Do not treat this as production detection content.
+title: Admin role granted (example)
+id: 5aa5c0de-face-4d00-8b00-0000feedface
+status: experimental
+description: >
+  Fires when an admin role is granted to a user on the simulated `fake`
+  platform. The `fake` platform mirrors the Okta System Log shape, so this
+  reads like a real identity-provider privilege-grant rule.
+author: SaaSHound maintainers (example rule)
+references:
+  - https://github.com/HarrisonHong/saashound
+logsource:
+  product: fake
+detection:
+  selection:
+    eventType: user.account.privilege.grant
+    outcome.result: SUCCESS
+  admin_role:
+    target.displayName|contains: ADMIN
+  condition: selection and admin_role
+level: high

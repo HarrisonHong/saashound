@@ -4,7 +4,7 @@ Adversary emulation with verified detection for SaaS and identity platforms. Run
 
 Point it at your own org and, technique by technique, it gives a verdict from the platform's own audit log, with proof it left nothing behind: *verified detection, not just detonation*.
 
-> **Status: Okta provider, pre-release.** The platform-agnostic engine - technique corpus and validator, op registry, planner, guardrail gate, write-ahead journal, verified cleanup, telemetry collection and matching, versioned JSON-lines output - now drives a real platform. The **Okta** provider runs documented Okta intrusion techniques against an org you own, cleans up provably, and reads the Okta **System Log** back to confirm the platform logged them. The built-in **simulated platform** (`fake`) still exercises the whole loop with no network and no credentials. The GitHub provider and the Sigma detection checker are the next increments.
+> **Status: Okta provider, pre-release.** The platform-agnostic engine - technique corpus and validator, op registry, planner, guardrail gate, write-ahead journal, verified cleanup, telemetry collection and matching, versioned JSON-lines output - now drives a real platform. The **Okta** provider runs documented Okta intrusion techniques against an org you own, cleans up provably, and reads the Okta **System Log** back to confirm the platform logged them. The built-in **simulated platform** (`fake`) still exercises the whole loop with no network and no credentials. The **Sigma detection checker** now evaluates a technique's referenced Sigma rules locally, against the run's own events, and reports per rule whether the rule fired - *verified detection, not just detonation*. The GitHub provider and the `exec` (operator-SIEM) checker are the next increments.
 
 ## Authorized use
 
@@ -83,9 +83,11 @@ TECHNIQUE                                        VERDICT  TELEMETRY   DETECTIONS
 fake.persistence.mfa-factor-register             pass     2/2 (0.0s)  -           verified
 fake.defense-impairment.network-zone-deactivate  pass     2/2 (0.0s)  -           verified
 
-$ ./saashound apply fake.privilege-escalation.admin-role-assign --target lab --yes -q | jq -c '{t: .technique, v: .verdict, cleanup: .cleanup.status}'
-{"t":"fake.privilege-escalation.admin-role-assign","v":"pass","cleanup":"verified"}
+$ ./saashound apply fake.privilege-escalation.admin-role-assign --target lab --yes -q | jq -c '{t: .technique, v: .verdict, det: [.detections[] | {rule, status}]}'
+{"t":"fake.privilege-escalation.admin-role-assign","v":"pass","det":[{"rule":"Admin role granted (example)","status":"fired"}]}
 ```
+
+This technique references a bundled example Sigma rule, so the detection checker evaluates it end to end on the simulated platform. For a real platform, point `--sigma-rules` at your own Sigma checkout (or set `$SAASHOUND_SIGMA_RULES`); a technique references a rule by its Sigma UUID. A referenced rule that does not fire makes the verdict `detection-missing` (exit 1); one that is not found is reported as `unknown`, never a silent pass.
 
 If a run is interrupted, the first Ctrl-C stops detonating and cleans up; a second abandons cleanup and prints the command to resume it. A crashed or abandoned run is recovered from its journal:
 
@@ -153,7 +155,7 @@ Everything else - the plan, the guardrail, the verified cleanup, the System Log 
 | `list`, `show <technique>` | The corpus; a technique's steps, inverses, expected events, detections, safety. |
 | `validate [file.yaml\|dir ...]` | Validate technique files against the schema and the registered ops. |
 | `plan <technique...> --target T [-o plan.json] [--offline]` | Read-only dry run, including the guardrail result. |
-| `apply <technique...> --target T` / `apply --plan plan.json` | Detonate, clean up and prove it, collect telemetry, match expectations, report. A saved plan is re-derived from the corpus and refused if it differs. |
+| `apply <technique...> --target T` / `apply --plan plan.json` | Detonate, clean up and prove it, collect telemetry, match expectations, check the referenced Sigma rules (`--sigma-rules <dir>`), report. A saved plan is re-derived from the corpus and refused if it differs. |
 | `cleanup <run-id>... \| --all` | Replay journals; undo and prove gone. Idempotent. Every run is attempted; a refused one is reported and the rest still run. Abandoning a cleanup (second Ctrl-C) stops the command; the runs not attempted are listed with their retry command. |
 | `status [--json]` | Runs and their states, derived from their journals. |
 | `sweep --target T [--delete]` | Find `saashound-` objects; remove those no local journal accounts for, after confirmation. |
@@ -191,7 +193,7 @@ In short:
 - **Write-ahead journal, verified cleanup.** The executor ([internal/engine](internal/engine)) writes and fsyncs an intent before every call and the result after it. Cleanup is a pure function of the journal: undo in reverse, treat "not found" as success, require `Gone`. An intent without a result (the process died mid-call) is resolved by exact-name lookup, never by substring search. Cleanup runs before telemetry collection, so nothing stays open during log latency.
 - **Correlation is exact.** Every request carries the run's User-Agent with its phase; the collector ([internal/telemetry](internal/telemetry)) keeps only events whose recorded User-Agent carries this run's ID, matches expectations against detonation-phase events only, and stops as soon as every expectation is met or its deadline passes. Its own audit-log reads carry the `collect` phase. A run whose telemetry was not collected to the end (an API failure, a Ctrl-C) is never a pass.
 - **The provider boundary is open.** A platform is one package implementing `provider.Provider` ([internal/provider/provider.go](internal/provider/provider.go)): its op vocabulary, an `AuditSource`, and a `Tenant` with `Whoami`, `ReadMarker`, `Capabilities` and `Sweep`. It registers itself from `init()` and is linked by one import line in [providers/all.go](providers/all.go). Nothing in the core switches on platform names: adding Okta changed no core package. [providers/fake](providers/fake) is the reference implementation and [providers/okta](providers/okta) is the first real one (a hand-written `net/http` client - no vendor SDK - with SSWS token auth, 429 back-off, Link-header pagination and strict secret redaction); both pass the same conformance suite in [internal/conformance](internal/conformance).
-- **Detection checkers are a seam.** [internal/detect](internal/detect) defines the interface the Sigma and `exec` checkers will implement; the engine already folds their results into the verdict.
+- **Detection checkers are a seam.** [internal/detect](internal/detect) defines a narrow checker interface; the engine folds each checker's results into the verdict. The **Sigma** checker ([internal/detect/sigma](internal/detect/sigma)) implements it with [`runreveal/sigmalite`](https://github.com/runreveal/sigmalite): it loads the operator's own Sigma rules from a local directory (`--sigma-rules`, never vendored), maps the platform's raw events to the fields the rules key on, and evaluates each referenced rule against the run's detonation-phase events. A rule that is not found is `unknown` and one it cannot evaluate (a Sigma v2 correlation rule, or a rule the evaluator cannot parse) is `unsupported`, never a wrong pass. The `exec` (operator-SIEM) checker is the next increment behind the same seam.
 
 | Package | Role |
 |---|---|
@@ -206,6 +208,7 @@ In short:
 | `internal/engine` | Executor, cleaner, orchestration, orphan removal. |
 | `internal/telemetry` | Collector and expectation matcher. |
 | `internal/detect` | Detection-checker interface. |
+| `internal/detect/sigma` | Sigma detection checker: loads the operator's rules, maps events, evaluates referenced rules with `sigmalite`. |
 | `internal/report` | Result record, verdicts, exit codes, JSON lines and table. |
 | `internal/secret` | The redacting secret type and credential references. |
 | `internal/target`, `internal/state`, `internal/fsutil`, `internal/clock` | `targets.yaml`, run directories and locks, atomic private files, time. |
@@ -220,7 +223,7 @@ In short:
 - **Secrets.** Credentials come from an environment variable or a `0600` key file referenced in `targets.yaml`, never from a flag or the file itself. They are held in a type whose every formatting path prints `[redacted]`, and only a provider's transport may read the raw value. They never reach the journal, events, plan, result or logs; a canary test seeds a fake credential, drives every command at `-vv` and fails the build if it appears in any output or file.
 - **Local state** lives under the state directory in per-run directories (mode `0700`, files `0600`): `plan.json`, `journal.jsonl`, `events.jsonl`, `result.json`. One run per target at a time, enforced with a lock the kernel releases if the process dies.
 - **Architecture tests** ([internal/policy](internal/policy)) fail the build on `os/exec`, `text/template`, `plugin`, `reflect` or `unsafe` anywhere, on network imports outside real provider packages, on any listener, and on reading a raw secret outside a provider transport.
-- **Minimal dependencies:** the standard library, `go.yaml.in/yaml/v3` (the YAML project's maintained successor to `gopkg.in/yaml.v3`) and `github.com/spf13/cobra`.
+- **Minimal dependencies:** the standard library, `go.yaml.in/yaml/v3` (the YAML project's maintained successor to `gopkg.in/yaml.v3`), `github.com/spf13/cobra` and `github.com/runreveal/sigmalite` (the Sigma evaluator, which itself pulls in `gopkg.in/yaml.v3`).
 
 ## Development
 

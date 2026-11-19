@@ -117,6 +117,34 @@ func TestCombine(t *testing.T) {
 	}
 }
 
+func TestDetectionsCell(t *testing.T) {
+	cases := []struct {
+		name string
+		dets []detect.Result
+		want string
+	}{
+		{"none", nil, "-"},
+		{"fired", []detect.Result{{Status: detect.StatusFired, Fired: b(true)}}, "1/1"},
+		{"not fired", []detect.Result{{Status: detect.StatusNotFired, Fired: b(false)}}, "0/1"},
+		{"unknown", []detect.Result{{Status: detect.StatusUnknown}}, "0/1 (unknown)"},
+		{"unsupported", []detect.Result{{Status: detect.StatusUnsupported}}, "0/1 (unsupported)"},
+		{"mixed", []detect.Result{
+			{Status: detect.StatusFired, Fired: b(true)},
+			{Status: detect.StatusUnknown},
+			{Status: detect.StatusUnsupported},
+		}, "1/3 (unknown,unsupported)"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := rec()
+			r.Detections = c.dets
+			if got := detectionsCell(r); got != c.want {
+				t.Fatalf("detectionsCell = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestTable(t *testing.T) {
 	var buf bytes.Buffer
 	tb := &Table{W: &buf, Color: true}

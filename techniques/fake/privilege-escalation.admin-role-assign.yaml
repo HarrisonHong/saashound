@@ -32,4 +32,7 @@ expect:
 cleanup:
   order: [grant, victim]
 detections:
-  - sigma: null
+  # References the bundled example rule (internal/detect/sigma/examplerules),
+  # so the Sigma detection checker proves out end to end on the simulated
+  # platform. Real platforms reference the operator's own rules by their id.
+  - sigma: 5aa5c0de-face-4d00-8b00-0000feedface

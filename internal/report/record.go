@@ -78,7 +78,8 @@ type Record struct {
 	Detonate      Detonate  `json:"detonate"`
 	Cleanup       Cleanup   `json:"cleanup"`
 	Telemetry     Telemetry `json:"telemetry"`
-	// Detections is always an array; empty when no checker is configured.
+	// Detections is always an array; empty when no checker is configured or
+	// the technique references no rule to check.
 	Detections []detect.Result `json:"detections"`
 	Verdict    string          `json:"verdict"`
 	// Reason explains a verdict other than pass in one sentence.

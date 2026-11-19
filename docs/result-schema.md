@@ -39,7 +39,7 @@ This document is the contract. `internal/cli/testdata/golden/*.jsonl` pins the e
 | `detonate` | object | What the executor did; see below. |
 | `cleanup` | object | What the cleaner proved; see below. |
 | `telemetry` | object | What the platform's audit log showed; see below. |
-| `detections` | array | One entry per detection checked; empty when no detection checker is configured. |
+| `detections` | array | One entry per detection checked; empty when the technique references no rule to check. See [`detections`](#detections). |
 | `verdict` | string | See [Verdicts](#verdicts). |
 | `reason` | string | One sentence explaining any verdict other than `pass`. Omitted on `pass`. |
 
@@ -95,18 +95,27 @@ An expectation is only ever met by an event that was actually read. If collectio
 
 ## `detections`
 
-Each entry is one detection a checker evaluated. No checker ships in this version; the interface (`internal/detect`) is in place for the Sigma and `exec` checkers.
+Each entry is one detection a checker evaluated. The `sigma` checker ships: it evaluates the technique's referenced Sigma rules locally, against exactly the events the run produced (its detonation-phase events), and reports per rule whether the rule fired. A technique's `sigma: null` mapping is a published coverage-gap statement ("no public rule covers this"), not a runtime check, so it produces no entry. The `exec` (operator-SIEM) checker is a later increment; the interface (`internal/detect`) is the shared seam.
 
 | Key | Type | Meaning |
 |---|---|---|
 | `detections[].checker` | string | `sigma`, `exec`, ... |
 | `detections[].rule` | string | Rule title. |
-| `detections[].id` | string | Stable rule ID (a Sigma rule's UUID). |
+| `detections[].id` | string | Stable rule ID (a Sigma rule's UUID), or the reference as written when the rule was not found. |
 | `detections[].author` | string | Rule author, carried as the Detection Rule License 1.1 requires for reported matches. |
 | `detections[].name` | string | For `exec`, the configured check's name. |
-| `detections[].fired` | boolean or null | Whether the detection fired; null if the checker could not decide. |
+| `detections[].status` | string | `fired` (the rule matched an event), `not-fired` (evaluated, matched nothing), `unknown` (the referenced rule was not found in the loaded rules, or the reference is ambiguous: an id declared by more than one rule, a title shared by several rules, or a path to a file holding several rules), `unsupported` (the rule uses a construct the checker cannot evaluate, such as a Sigma v2 correlation rule or a modifier or condition the evaluator cannot parse; `error` carries the parse error), or `error` (the checker failed). `unknown`, `unsupported` and `error` never count as a pass and never as a "did not fire": they are reported, and `fired` is null. |
+| `detections[].fired` | boolean or null | Whether the detection fired; null unless `status` is `fired` (true) or `not-fired` (false), so a detection the checker could not decide is neither a pass nor a failure. |
 | `detections[].latency_s` | number | Time to fire, when known. |
-| `detections[].error` | string | Why the checker could not decide. |
+| `detections[].error` | string | Why the checker could not decide (`unknown`, `unsupported` or `error`). |
+
+Only a `not-fired` detection fails the run: it makes the verdict `detection-missing` (exit 1) when telemetry otherwise passed. An `unknown` or `unsupported` detection is surfaced in the record and the table (the `DETECTIONS` column shows, e.g., `0/1 (unknown)`) but does not by itself fail the run, because the checker makes no "did not fire" claim it cannot stand behind.
+
+Known limitation: the `sigma` checker judges `fired` / `not-fired` over exactly the events the telemetry collector captured (verbatim, no re-poll), by design: it consumes what the collector produced. Collection stops once the technique's own telemetry expectations are resolved, so a rule keyed on an event outside those expectations may be reported `not-fired`. Widening collection for detection-only events is a possible future increment.
+
+A field-less Sigma keyword search is matched against the whole raw event, not one field.
+
+Operator-supplied Sigma rules are loaded from the directory named by `apply --sigma-rules <dir>`, else `$SAASHOUND_SIGMA_RULES`, else a `sigma-rules/` directory beside `targets.yaml`. A small set of example rules for the simulated `fake` platform is always bundled; SigmaHQ's rule repository is never vendored.
 
 ## Verdicts
 

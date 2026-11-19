@@ -65,6 +65,14 @@ Exit codes: 0 every expectation met, 1 an expectation failed, 2 refused,
 				return err
 			}
 
+			// Build the detection checker before locking or opening the
+			// tenant, so a bad --sigma-rules fails fast and nothing is
+			// touched.
+			chk, err := a.sigmaChecker()
+			if err != nil {
+				return err
+			}
+
 			lock, err := a.st.LockTarget(t.Name)
 			if err != nil {
 				return refused("%v", err)
@@ -90,6 +98,7 @@ Exit codes: 0 every expectation met, 1 an expectation failed, 2 refused,
 			dctx, cctx, stop := a.interrupts(cmd.Context(), "interrupted: stopping detonation and cleaning up (Ctrl-C again to abandon cleanup)")
 			defer stop()
 			eng := a.engine()
+			eng.Checkers = []detect.Checker{chk}
 			sink := a.sink()
 			var records []*report.Record
 			stopReason := ""
@@ -136,6 +145,7 @@ Exit codes: 0 every expectation met, 1 an expectation failed, 2 refused,
 	rf.register(cmd)
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "confirm without typing the tenant name (required when not on a terminal)")
 	cmd.Flags().StringVar(&planPath, "plan", "", "execute exactly this saved plan; refused if it no longer matches")
+	cmd.Flags().StringVar(&a.sigmaRules, "sigma-rules", "", "directory of Sigma rules the sigma detection checker evaluates (default $SAASHOUND_SIGMA_RULES or a sigma-rules/ dir beside targets.yaml); bundled example rules are always loaded")
 	cmd.Flags().BoolVar(&a.jsonl, "jsonl", false, "JSON lines on stdout even on a terminal")
 	return cmd
 }

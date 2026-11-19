@@ -165,13 +165,17 @@ func (e *Engine) observe(ctx context.Context, tenant provider.Tenant, p *plan.Ru
 	tel := e.telemetryRecord(p, res.Outcomes, res.Error)
 	e.emitTelemetry(run, tel, e.Clock.Now().Sub(start))
 
+	// Checkers judge exactly the events the collector captured (res.Events,
+	// verbatim, no re-poll). Collection stops once the technique's telemetry
+	// expectations are resolved, so a rule keyed on an event outside those
+	// expectations may be reported not-fired; this is an accepted limitation.
 	for _, c := range e.Checkers {
 		rs, err := c.Check(ctx, detect.Input{
 			Run: run, Technique: p.Technique, Platform: p.Platform, Mappings: p.Detections,
 			Events: res.Events, WindowStart: since, WindowEnd: e.Clock.Now(),
 		})
 		if err != nil {
-			detections = append(detections, detect.Result{Checker: c.Name(), Error: err.Error()})
+			detections = append(detections, detect.Result{Checker: c.Name(), Status: detect.StatusError, Error: err.Error()})
 			continue
 		}
 		detections = append(detections, rs...)

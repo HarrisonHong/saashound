@@ -25,6 +25,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/HarrisonHong/saashound/internal/clock"
+	"github.com/HarrisonHong/saashound/internal/detect/sigma"
 	"github.com/HarrisonHong/saashound/internal/engine"
 	"github.com/HarrisonHong/saashound/internal/guard"
 	"github.com/HarrisonHong/saashound/internal/provider"
@@ -109,6 +110,7 @@ type app struct {
 	targetsPath string
 	stateDir    string
 	corpusDir   string
+	sigmaRules  string
 	quiet       bool
 	verbose     int
 	noColor     bool
@@ -338,6 +340,50 @@ func (a *app) engine() *engine.Engine {
 		Progress:      a.progress.event,
 		Hook:          a.env.Hook,
 	}
+}
+
+// sigmaRulesDir returns the directory of operator-supplied Sigma rules: the
+// --sigma-rules flag, else $SAASHOUND_SIGMA_RULES, else a `sigma-rules`
+// directory beside targets.yaml if one exists. It returns "" when none is
+// configured, in which case only the bundled example rules are loaded.
+func (a *app) sigmaRulesDir() string {
+	if a.sigmaRules != "" {
+		return a.sigmaRules
+	}
+	if d := a.env.Getenv("SAASHOUND_SIGMA_RULES"); d != "" {
+		return d
+	}
+	def := filepath.Join(filepath.Dir(a.targetsPath), "sigma-rules")
+	if fi, err := os.Stat(def); err == nil && fi.IsDir() {
+		return def
+	}
+	return ""
+}
+
+// sigmaChecker builds the Sigma detection checker: the bundled example rules
+// plus every rule under the operator's rules directory. A directory named
+// explicitly (flag or env) that cannot be read is a refusal; a directory only
+// discovered is already known to exist. Non-fatal load problems are summarised
+// on stderr as one count, with the per-file detail at -v, so a large rule
+// checkout cannot bury real alarms; a problem with a rule a technique actually
+// references is carried in that detection's record.
+func (a *app) sigmaChecker() (*sigma.Checker, error) {
+	dir := a.sigmaRulesDir()
+	chk, err := sigma.Load(dir)
+	if err != nil {
+		return nil, refused("%v", err)
+	}
+	rs := chk.RuleSet()
+	if n := len(rs.Warnings()); n > 0 {
+		a.progress.event(engine.Event{Stage: "sigma", Msg: fmt.Sprintf("%d Sigma rule(s) could not be loaded; run with -v for details", n)})
+	}
+	for _, w := range rs.Warnings() {
+		a.progress.event(engine.Event{Level: 1, Stage: "sigma", Msg: "rule not loaded: " + w})
+	}
+	if dir != "" {
+		a.progress.event(engine.Event{Level: 1, Stage: "sigma", Msg: fmt.Sprintf("loaded %d rules (incl. bundled examples) from %s", rs.Len(), dir)})
+	}
+	return chk, nil
 }
 
 // interactive reports whether typed confirmation is possible.
