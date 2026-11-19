@@ -17,12 +17,16 @@
 // v2 correlation rule, or a rule it cannot parse) is reported as unsupported.
 // The checker only ever claims a rule fired when it actually matched an event.
 //
-// Known limitation: fired/not-fired is judged over exactly the events the
-// telemetry collector captured, verbatim, with no re-poll - the design
-// constraint is to consume what the collector produced. The collector stops
-// once the technique's own expectations are resolved, so a rule keyed on an
-// event outside those expectations may be reported not-fired. Widening
-// collection for detection-only events is a possible future increment.
+// Fired/not-fired is judged over exactly the events the telemetry collector
+// captured, verbatim: the checker never polls the audit log itself. The
+// checker is a detect.Awaiter, so the collector does not stop the moment the
+// technique's expectations are resolved while a referenced rule has not
+// fired yet: it drains for a bounded number of further polls
+// (telemetry.DrainPolls), so a rule keyed on an event that lands a little
+// after the expected ones is still judged on it. The drain is a safety net,
+// not a guarantee: a referenced rule's keyed events must be covered by the
+// technique's declared expectations (docs/technique-authoring.md), so the
+// collector waits for them up to their deadline.
 package sigma
 
 import (
@@ -57,7 +61,10 @@ type Checker struct {
 	rules *RuleSet
 }
 
-var _ detect.Checker = (*Checker)(nil)
+var (
+	_ detect.Checker = (*Checker)(nil)
+	_ detect.Awaiter = (*Checker)(nil)
+)
 
 // New returns a checker over an already-loaded rule set.
 func New(rs *RuleSet) *Checker { return &Checker{rules: rs} }
@@ -104,6 +111,20 @@ func (c *Checker) Check(_ context.Context, in detect.Input) ([]detect.Result, er
 	return out, nil
 }
 
+// Awaiting implements detect.Awaiter: it reports whether some referenced rule
+// has not fired on in's events yet, and so might on an event not read yet. A
+// fire is final (a match stays a match as events are added), and unknown or
+// unsupported do not depend on the events, so only not-fired waits.
+func (c *Checker) Awaiting(in detect.Input) bool {
+	rs, _ := c.Check(context.Background(), in) // Check never fails
+	for _, r := range rs {
+		if r.Status == detect.StatusNotFired {
+			return true
+		}
+	}
+	return false
+}
+
 // evaluate resolves one rule reference and, when found, runs it against the
 // run's detonation-phase events.
 func (c *Checker) evaluate(ref string, events []telemetry.Seen) detect.Result {
@@ -139,9 +160,9 @@ func (c *Checker) evaluate(ref string, events []telemetry.Seen) detect.Result {
 // events are the tool undoing itself, so matching them would be a false fire;
 // the detection question is whether the rule fires on the adversary action.
 //
-// events is exactly what the collector captured: the checker never re-polls,
-// so "no match" means no match among the collected events (see the package
-// comment for the limitation this implies).
+// events is exactly what the collector captured: the checker never polls,
+// so "no match" means no match among the collected events, including those
+// the collector's drain read for this checker (see the package comment).
 func matchAny(rule *sigmalite.Rule, events []telemetry.Seen) bool {
 	for _, ev := range events {
 		if ev.Phase != marker.PhaseDetonate {

@@ -47,7 +47,10 @@ const (
 	// cannot evaluate faithfully (for Sigma, a v2 correlation rule or a rule
 	// the evaluator cannot parse).
 	StatusUnsupported = "unsupported"
-	// StatusError: the checker failed to evaluate this rule.
+	// StatusError: the checker failed to evaluate this rule, or the drain
+	// was interrupted or ended on a failed audit poll before a rule that
+	// had not fired yet could be judged on every event the drain would
+	// have read.
 	StatusError = "error"
 )
 
@@ -88,4 +91,20 @@ func Fire(status string) *bool {
 type Checker interface {
 	Name() string
 	Check(ctx context.Context, in Input) ([]Result, error)
+}
+
+// Awaiter is implemented by a checker that judges the run's collected events
+// itself, locally and cheaply, as "sigma" does. Such a checker's "did not
+// fire" can be wrong only because an event it keys on had not been read
+// yet, so the engine keeps reading the audit log for a bounded drain after
+// the technique's expectations are met, for as long as some Awaiter is still
+// awaiting. A checker that does not implement it, such as "exec" (which
+// queries the operator's SIEM rather than the collected events), is run
+// exactly as before.
+type Awaiter interface {
+	// Awaiting reports whether more of the run's events could still change
+	// a result Check would return for in: a rule that has not fired yet.
+	// It must be cheap, local and free of side effects: the collector calls
+	// it again as new events arrive.
+	Awaiting(in Input) bool
 }

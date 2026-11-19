@@ -157,6 +157,7 @@ func (e *Engine) observe(ctx context.Context, tenant provider.Tenant, p *plan.Ru
 		Trace: func(format string, a ...any) {
 			e.emit(Event{Run: run, Level: 2, Stage: "telemetry", Msg: fmt.Sprintf(format, a...)})
 		},
+		Await: e.awaiting(p, since),
 	}
 	res := col.Collect(cctx, run, since, exps)
 	if err := e.writeEvents(run, res.Events); err != nil {
@@ -166,21 +167,73 @@ func (e *Engine) observe(ctx context.Context, tenant provider.Tenant, p *plan.Ru
 	e.emitTelemetry(run, tel, e.Clock.Now().Sub(start))
 
 	// Checkers judge exactly the events the collector captured (res.Events,
-	// verbatim, no re-poll). Collection stops once the technique's telemetry
-	// expectations are resolved, so a rule keyed on an event outside those
-	// expectations may be reported not-fired; this is an accepted limitation.
+	// verbatim), including those its drain read while an Awaiter was still
+	// waiting on a rule keyed on an event outside the expectations.
+	in := e.detectInput(p, res.Events, since)
 	for _, c := range e.Checkers {
-		rs, err := c.Check(ctx, detect.Input{
-			Run: run, Technique: p.Technique, Platform: p.Platform, Mappings: p.Detections,
-			Events: res.Events, WindowStart: since, WindowEnd: e.Clock.Now(),
-		})
+		rs, err := c.Check(ctx, in)
 		if err != nil {
 			detections = append(detections, detect.Result{Checker: c.Name(), Status: detect.StatusError, Error: err.Error()})
 			continue
 		}
+		if _, ok := c.(detect.Awaiter); ok && res.Unsettled != telemetry.Settled {
+			rs = unproven(rs, res.Unsettled, res.DrainError)
+		}
 		detections = append(detections, rs...)
 	}
 	return tel, detections
+}
+
+func (e *Engine) detectInput(p *plan.Run, events []telemetry.Seen, since time.Time) detect.Input {
+	return detect.Input{
+		Run: p.Run, Technique: p.Technique, Platform: p.Platform, Mappings: p.Detections,
+		Events: events, WindowStart: since, WindowEnd: e.Clock.Now(),
+	}
+}
+
+// awaiting is the collector's drain predicate: whether a checker that judges
+// the collected events itself (a detect.Awaiter) still has a rule that has
+// not fired on them. It is nil, so there is no drain, when no checker is an
+// Awaiter.
+func (e *Engine) awaiting(p *plan.Run, since time.Time) func([]telemetry.Seen) bool {
+	var ws []detect.Awaiter
+	for _, c := range e.Checkers {
+		if w, ok := c.(detect.Awaiter); ok {
+			ws = append(ws, w)
+		}
+	}
+	if len(ws) == 0 {
+		return nil
+	}
+	return func(events []telemetry.Seen) bool {
+		in := e.detectInput(p, events, since)
+		for _, w := range ws {
+			if w.Awaiting(in) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// unproven withdraws the not-fired claims of an Awaiter whose drain was
+// interrupted or ended on a failed audit poll: the event its rule keys on
+// may simply not have been read yet, so "did not fire" is unproven, never
+// reported as a detection gap. drainErr is the failed poll's error.
+func unproven(rs []detect.Result, why telemetry.Unsettled, drainErr string) []detect.Result {
+	reason := telemetry.Interrupted
+	if why == telemetry.UnsettledAuditFailure {
+		reason = fmt.Sprintf("the audit API failed on the last drain poll (%s)", drainErr)
+	}
+	for i := range rs {
+		if rs[i].Status != detect.StatusNotFired {
+			continue
+		}
+		rs[i].Status = detect.StatusError
+		rs[i].Fired = detect.Fire(detect.StatusError)
+		rs[i].Error = reason + " while waiting for an event this rule may key on, so not firing is unproven"
+	}
+	return rs
 }
 
 func (e *Engine) emitTelemetry(run string, t report.Telemetry, d time.Duration) {

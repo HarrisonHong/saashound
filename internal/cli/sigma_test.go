@@ -1,12 +1,17 @@
 package cli_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/HarrisonHong/saashound/internal/report"
+	"github.com/HarrisonHong/saashound/internal/telemetry"
+	"github.com/HarrisonHong/saashound/providers/fake"
 )
 
 // detections returns the record's detections array.
@@ -47,6 +52,9 @@ func TestSigmaDetectionFires(t *testing.T) {
 	}
 	if a, _ := d["author"].(string); a == "" {
 		t.Error("a reported match must carry the rule author")
+	}
+	if took := elapsed(t, rec); took != 0 {
+		t.Errorf("the rule fired on the first poll, yet collection took %s: nothing should wait for a decided detection", took)
 	}
 }
 
@@ -194,4 +202,129 @@ func writeFile(t *testing.T, path, body string) {
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestSigmaLateRuleEvent is the false not-fired trap: the referenced rule keys
+// on the privilege grant, the technique declares only the user creation, and
+// the grant lands a second after the creation was observed. Collection must
+// not stop at the declared expectation and leave the rule to judge an event
+// set without the grant: the detection is healthy and must be reported fired.
+func TestSigmaLateRuleEvent(t *testing.T) {
+	s := newSandbox(t)
+	s.initLab()
+	s.setOptions(t, map[string]string{"audit_lag/user.account.privilege.grant": "1s"})
+	corpus := t.TempDir()
+	undeclaredGrant(t, corpus)
+
+	r := s.run("--corpus-dir", corpus, "apply", "fake.privilege-escalation.admin-role-assign-latefire",
+		"--target", "lab", "--yes", "-q")
+	if r.code != report.ExitOK {
+		t.Fatalf("exit %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	rec := records(t, r.stdout)[0]
+	if rec["verdict"] != "pass" {
+		t.Fatalf("verdict %v (reason %v)", rec["verdict"], rec["reason"])
+	}
+	d := detections(t, rec)[0].(map[string]any)
+	if d["status"] != "fired" || d["fired"] != true {
+		t.Fatalf("a rule keyed on an event that lands late must still be judged on it: %v", d)
+	}
+	// The grant is readable 1s after detonation; the drain polls every
+	// 250ms and stops at the poll that reads it, not at its bound.
+	if took := elapsed(t, rec); took != time.Second {
+		t.Errorf("collection took %s; want 1s, stopping as soon as the rule fired", took)
+	}
+}
+
+// TestSigmaDrainIsBounded is the other half of the drain: when the event the
+// rule keys on never arrives, collection still ends after the bounded drain
+// and the run reports an honest not-fired (detection-missing, exit 1).
+func TestSigmaDrainIsBounded(t *testing.T) {
+	s := newSandbox(t)
+	s.initLab()
+	s.setOptions(t, map[string]string{"audit_drop": "user.account.privilege.grant"})
+	corpus := t.TempDir()
+	undeclaredGrant(t, corpus)
+
+	r := s.run("--corpus-dir", corpus, "apply", "fake.privilege-escalation.admin-role-assign-latefire",
+		"--target", "lab", "--yes", "-q")
+	if r.code != report.ExitExpectationFailed {
+		t.Fatalf("want exit 1 (detection missing), got %d\n%s\n%s", r.code, r.stdout, r.stderr)
+	}
+	rec := records(t, r.stdout)[0]
+	if rec["verdict"] != "detection-missing" {
+		t.Fatalf("verdict %v (reason %v)", rec["verdict"], rec["reason"])
+	}
+	if tel := rec["telemetry"].(map[string]any); tel["status"] != "observed" || tel["error"] != nil {
+		t.Fatalf("the drain must not touch the telemetry verdict: %v", tel)
+	}
+	d := detections(t, rec)[0].(map[string]any)
+	if d["status"] != "not-fired" || d["fired"] != false {
+		t.Fatalf("detection = %v", d)
+	}
+	if took, want := elapsed(t, rec), telemetry.DrainPolls*fake.New().Audit().PollInterval; took != want {
+		t.Fatalf("collection took %s; the drain is bounded at %d polls (%s)", took, telemetry.DrainPolls, want)
+	}
+}
+
+// elapsed is how long a sandbox run took. The sandbox clock only moves when
+// the collector waits between polls, so this is the time spent collecting.
+func elapsed(t *testing.T, rec map[string]any) time.Duration {
+	t.Helper()
+	parse := func(k string) time.Time {
+		v, _ := rec[k].(string)
+		ts, err := time.Parse(time.RFC3339Nano, v)
+		if err != nil {
+			t.Fatalf("record %s = %v: %v", k, rec[k], err)
+		}
+		return ts
+	}
+	return parse("finished").Sub(parse("started"))
+}
+
+// setOptions adds provider options to the lab target in targets.yaml.
+func (s *sandbox) setOptions(t *testing.T, opts map[string]string) {
+	t.Helper()
+	tp := filepath.Join(s.dir, "config", "targets.yaml")
+	b, err := os.ReadFile(tp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := make([]string, 0, len(opts))
+	for k := range opts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	block := "    options:\n"
+	for _, k := range keys {
+		block += fmt.Sprintf("      %q: %q\n", k, opts[k])
+	}
+	const anchor = "    test_domain: lab.example.com\n"
+	if !strings.Contains(string(b), anchor) {
+		t.Fatalf("targets.yaml has no lab test_domain line:\n%s", b)
+	}
+	if err := os.WriteFile(tp, []byte(strings.Replace(string(b), anchor, anchor+block, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// undeclaredGrant writes a copy of the shipped fake admin-role-assign
+// technique, id suffix "latefire", that still references the bundled example
+// rule (keyed on the privilege grant) but no longer declares the grant as an
+// expectation: the rule keys on an event outside the expectations, which the
+// authoring guide forbids and the collector's drain guards against.
+func undeclaredGrant(t *testing.T, dir string) {
+	t.Helper()
+	src, err := os.ReadFile(filepath.Join("..", "..", "techniques", "fake", "privilege-escalation.admin-role-assign.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(string(src),
+		"id: fake.privilege-escalation.admin-role-assign",
+		"id: fake.privilege-escalation.admin-role-assign-latefire", 1)
+	const grant = "  - after: grant\n    source: fake.audit\n    match: {eventType: user.account.privilege.grant, \"target[].id\": \"{{steps.grant.id}}\", \"target[].displayName\": READ_ONLY_ADMIN}\n"
+	if !strings.Contains(body, grant) {
+		t.Fatal("source technique no longer declares the grant expectation this test removes")
+	}
+	writeFile(t, filepath.Join(dir, "latefire.yaml"), strings.Replace(body, grant, "", 1))
 }

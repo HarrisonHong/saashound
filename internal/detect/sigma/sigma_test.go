@@ -368,3 +368,65 @@ func writeRule(t *testing.T, dir, name, body string) {
 		t.Fatal(err)
 	}
 }
+
+// TestAwaiting: the checker asks the collector to keep draining only while a
+// referenced rule has not fired on the events so far. A fire is final, and
+// unknown, unsupported and null references do not depend on the events, so
+// none of them waits; a match on a cleanup-phase event is no fire.
+func TestAwaiting(t *testing.T) {
+	dir := t.TempDir()
+	writeRule(t, dir, "corr.yml", `
+title: Many grants in a short window
+id: corr-0001
+correlation:
+  type: event_count
+  rules: [some-base-rule]
+  group-by: [actor.id]
+  timespan: 5m
+  condition: {gte: 5}
+`)
+	writeRule(t, dir, "failed-create.yml", `
+title: Failed user creation (example)
+id: deadbeef-0000-4000-8000-000000000002
+logsource: {product: fake}
+detection:
+  selection:
+    eventType: user.lifecycle.create
+    outcome.result: FAILURE
+  condition: selection
+`)
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant := seen(marker.PhaseDetonate, grantEvent)
+	create := seen(marker.PhaseDetonate, createEvent)
+	cases := []struct {
+		name     string
+		mappings []mapping
+		events   []telemetry.Seen
+		want     bool
+	}{
+		{"keyed event not read yet", []mapping{{"sigma", exampleRuleID}}, []telemetry.Seen{create}, true},
+		{"no events yet", []mapping{{"sigma", exampleRuleID}}, nil, true},
+		{"only a cleanup-phase match", []mapping{{"sigma", exampleRuleID}}, []telemetry.Seen{seen(marker.PhaseCleanup, grantEvent)}, true},
+		{"fired", []mapping{{"sigma", exampleRuleID}}, []telemetry.Seen{create, grant}, false},
+		{"one fired, one still waiting", []mapping{{"sigma", exampleRuleID}, {"sigma", "deadbeef-0000-4000-8000-000000000002"}}, []telemetry.Seen{create, grant}, true},
+		{"unknown rule", []mapping{{"sigma", "deadbeef-0000-4000-8000-0000000000ff"}}, []telemetry.Seen{create}, false},
+		{"unsupported rule", []mapping{{"sigma", "corr-0001"}}, []telemetry.Seen{create}, false},
+		{"null reference", []mapping{{"sigma", ""}}, []telemetry.Seen{create}, false},
+		{"another checker's reference", []mapping{{"elastic", exampleRuleID}}, []telemetry.Seen{create}, false},
+		{"no references", nil, []telemetry.Seen{create}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := detect.Input{Run: "abc123", Technique: "fake.t", Platform: "fake", Events: tc.events}
+			for _, m := range tc.mappings {
+				in.Mappings = append(in.Mappings, plan.Detection{Checker: m.checker, Rule: m.rule})
+			}
+			if got := c.Awaiting(in); got != tc.want {
+				t.Fatalf("Awaiting = %v, want %v (results %+v)", got, tc.want, check(t, c, tc.mappings, tc.events...))
+			}
+		})
+	}
+}

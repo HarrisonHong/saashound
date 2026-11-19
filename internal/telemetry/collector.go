@@ -34,6 +34,30 @@ const (
 // before every expectation was resolved.
 const Interrupted = "telemetry collection was interrupted"
 
+// Unsettled says why a drain ended while Await still reported a detection
+// waiting without the audit log having been read to the drain's end, so a
+// "did not fire" judged over the collected events is unproven.
+type Unsettled string
+
+const (
+	// Settled: there was no drain, it ended because nothing was waiting any
+	// more, or it spent its polls and the last one read the audit log.
+	Settled Unsettled = ""
+	// UnsettledInterrupted: collection was cancelled during the drain.
+	UnsettledInterrupted Unsettled = "interrupted"
+	// UnsettledAuditFailure: the drain spent its polls and the last one
+	// failed. Every poll re-reads the whole window, so a successful poll
+	// covers the failed ones before it, but nothing covers a failed last
+	// one.
+	UnsettledAuditFailure Unsettled = "audit-failure"
+)
+
+// DrainPolls bounds the drain (see Collector.Await): once every expectation
+// is resolved, the collector polls at most this many more times, one poll
+// interval apart, so it can never extend a run by more than DrainPolls poll
+// intervals.
+const DrainPolls = 5
+
 // Expectation is one resolved expectation.
 type Expectation struct {
 	After string
@@ -71,7 +95,17 @@ type Result struct {
 	Events   []Seen
 	Outcomes []Outcome
 	// Error is a persistent audit API failure or an interruption, if any.
+	// The drain never sets it: by then every expectation is resolved.
 	Error string
+	// Unsettled is not Settled when the drain ended, by an interruption or
+	// with a failed last poll, while Await still reported a detection
+	// waiting for an event, so a "did not fire" judged over Events is
+	// unproven.
+	Unsettled Unsettled
+	// DrainError is the error of the drain's last poll when Unsettled is
+	// UnsettledAuditFailure. It is never a telemetry error: the
+	// expectations were resolved before the drain started.
+	DrainError string
 }
 
 // Collector polls an audit source.
@@ -84,6 +118,19 @@ type Collector struct {
 	Skew time.Duration
 	// Trace receives per-event matching detail (-vv).
 	Trace func(format string, a ...any)
+	// Await, if set, extends collection for the detection checkers. A rule
+	// may key on an event no expectation asked for, which can land after the
+	// expected ones; stopping the moment the expectations are resolved would
+	// leave the rule to judge an event set without it. So once every
+	// expectation is resolved, the collector keeps polling, at most
+	// DrainPolls more times and one poll interval apart, for as long as
+	// Await reports that the events seen so far still leave a detection
+	// waiting. The drain only widens Events: outcomes are final before it
+	// starts. A drain that is interrupted, or whose last poll fails, while
+	// Await still reports a detection waiting is recorded in
+	// Result.Unsettled. Nil stops collection as soon as the expectations
+	// are resolved.
+	Await func(events []Seen) bool
 }
 
 func (c *Collector) trace(format string, a ...any) {
@@ -93,7 +140,8 @@ func (c *Collector) trace(format string, a ...any) {
 }
 
 // Collect polls from since until every expectation is met or its deadline
-// passes, and returns the run's events and an outcome per expectation.
+// passes, then drains for the detection checkers (see Await), and returns
+// the run's events and an outcome per expectation.
 //
 // An event first seen after its deadline is late when an earlier successful
 // poll, at or before the deadline, did not return it. When no poll happened
@@ -117,24 +165,22 @@ func (c *Collector) Collect(ctx context.Context, run string, since time.Time, ex
 			last = d
 		}
 	}
+	// The drain follows only a collection that checked every expectation.
+	checkedAll := len(exps) > 0 && len(pending) == len(exps)
 	seen := map[string]bool{}
-	var pollErr error
 	var firstPoll time.Time
-	for len(pending) > 0 {
-		if ctx.Err() != nil {
-			break
-		}
-		now := c.Clock.Now()
+
+	// poll reads the audit log once, keeps the run's events it has not seen
+	// before and resolves the pending expectations they match. It returns
+	// how many new run events it kept, and the poll's error.
+	poll := func(now time.Time) (int, error) {
 		evs, err := c.Source.Poll(ctx, provider.AuditQuery{Since: since.Add(-c.Skew), Until: now.Add(c.Skew), Run: run})
 		if err != nil {
-			pollErr = err
 			c.trace("audit poll failed: %v", err)
-		} else {
-			pollErr = nil
-			if firstPoll.IsZero() {
-				firstPoll = now
-			}
+		} else if firstPoll.IsZero() {
+			firstPoll = now
 		}
+		kept := 0
 		for _, ev := range evs {
 			if seen[ev.ID] {
 				continue
@@ -144,10 +190,11 @@ func (c *Collector) Collect(ctx context.Context, run string, since time.Time, ex
 				continue // not this run's: another run, a person, the platform
 			}
 			seen[ev.ID] = true
+			kept++
 			s := Seen{Event: ev, Phase: ua.Phase, FirstSeen: now}
 			res.Events = append(res.Events, s)
 			c.trace("event %s %s phase=%s", ev.ID, ev.Type, ua.Phase)
-			if ua.Phase != marker.PhaseDetonate {
+			if ua.Phase != marker.PhaseDetonate || len(pending) == 0 {
 				continue
 			}
 			doc, err := Decode(ev.Raw)
@@ -177,6 +224,16 @@ func (c *Collector) Collect(ctx context.Context, run string, since time.Time, ex
 				delete(pending, i)
 			}
 		}
+		return kept, err
+	}
+
+	var pollErr error
+	for len(pending) > 0 {
+		if ctx.Err() != nil {
+			break
+		}
+		now := c.Clock.Now()
+		_, pollErr = poll(now)
 		if len(pending) == 0 || !now.Before(last) || ctx.Err() != nil {
 			break
 		}
@@ -197,9 +254,56 @@ func (c *Collector) Collect(ctx context.Context, run string, since time.Time, ex
 		}
 		res.Error = Interrupted + ": " + err.Error()
 	}
+	if checkedAll && len(pending) == 0 {
+		c.drain(ctx, &res, poll)
+	}
 	res.Outcomes = outcomes
 	sort.SliceStable(res.Events, func(i, j int) bool { return res.Events[i].Time.Before(res.Events[j].Time) })
 	return res
+}
+
+// drain is the post-expectation drain (see Await). It follows only a
+// collection that saw every expectation's event: when one is missing or
+// not-run the verdict cannot reach the detections (and for a missing one
+// the main loop has already polled up to the last deadline). A failed
+// drain poll is traced and retried on the next one, and never becomes
+// Result.Error, since every expectation is already resolved. Every poll
+// re-reads the whole window, so a successful poll covers the failed ones
+// before it. An interruption while a detection is still waiting, or a
+// spent drain whose last poll failed, sets Result.Unsettled.
+func (c *Collector) drain(ctx context.Context, res *Result, poll func(time.Time) (int, error)) {
+	if c.Await == nil || !c.Await(res.Events) {
+		return
+	}
+	c.trace("expectations resolved, a detection is still waiting: draining for up to %d more polls", DrainPolls)
+	var lastErr error
+	for n := 1; n <= DrainPolls; n++ {
+		if c.Clock.Sleep(ctx, c.Info.PollInterval) != nil || ctx.Err() != nil {
+			c.trace("drain interrupted after %d of %d polls, a detection still waiting", n-1, DrainPolls)
+			res.Unsettled = UnsettledInterrupted
+			return
+		}
+		kept, err := poll(c.Clock.Now())
+		lastErr = err
+		// A rule that fired stays fired, so a fire is final even if the
+		// poll was the last thing before an interrupt.
+		if kept > 0 && !c.Await(res.Events) {
+			c.trace("drain: no detection waiting after %d of %d polls", n, DrainPolls)
+			return
+		}
+		if ctx.Err() != nil {
+			c.trace("drain interrupted at poll %d of %d, a detection still waiting", n, DrainPolls)
+			res.Unsettled = UnsettledInterrupted
+			return
+		}
+	}
+	if lastErr != nil {
+		c.trace("drain: %d polls spent and the last one failed, a detection still waiting", DrainPolls)
+		res.Unsettled = UnsettledAuditFailure
+		res.DrainError = lastErr.Error()
+		return
+	}
+	c.trace("drain: %d polls spent, a detection still waiting", DrainPolls)
 }
 
 // Unsupported returns outcomes for a tier without an audit API.

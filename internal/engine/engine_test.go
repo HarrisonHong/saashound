@@ -23,6 +23,7 @@ import (
 	"github.com/HarrisonHong/saashound/internal/state"
 	"github.com/HarrisonHong/saashound/internal/target"
 	"github.com/HarrisonHong/saashound/internal/technique"
+	"github.com/HarrisonHong/saashound/internal/telemetry"
 	"github.com/HarrisonHong/saashound/providers/fake"
 	"github.com/HarrisonHong/saashound/techniques"
 )
@@ -498,6 +499,99 @@ func TestDetectionCheckerSeam(t *testing.T) {
 		if rec.Verdict != want || len(rec.Detections) != 1 {
 			t.Fatalf("fired=%v: verdict %s detections %+v", fired, rec.Verdict, rec.Detections)
 		}
+		// A checker that does not judge the collected events itself (the
+		// exec seam) is not a detect.Awaiter: it never extends collection.
+		if !rec.Finished.Equal(rec.Started) {
+			t.Fatalf("fired=%v: collection took %s; only an Awaiter drains", fired, rec.Finished.Sub(rec.Started))
+		}
+	}
+}
+
+// awaitingChecker is a detect.Awaiter whose rule never fires.
+type awaitingChecker struct{ onAwait func() }
+
+func (awaitingChecker) Name() string { return "awaiting" }
+func (a awaitingChecker) Check(context.Context, detect.Input) ([]detect.Result, error) {
+	return []detect.Result{{Checker: "awaiting", Rule: "Never fires", Status: detect.StatusNotFired, Fired: detect.Fire(detect.StatusNotFired)}}, nil
+}
+func (a awaitingChecker) Awaiting(detect.Input) bool {
+	if a.onAwait != nil {
+		a.onAwait()
+	}
+	return true
+}
+
+// TestInterruptedDrainIsNotADetectionGap: a Ctrl-C during the drain must not
+// publish "did not fire" for a rule whose event may simply not have been read
+// yet. The telemetry stays fully checked; the detection is reported as an
+// error with the reason, fired is null, and the verdict is not
+// detection-missing. A checker that is not an Awaiter keeps its result.
+func TestInterruptedDrainIsNotADetectionGap(t *testing.T) {
+	w := newWorld(t, nil)
+	p := w.plan("fake.persistence.mfa-factor-register")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e := w.engine(nil)
+	e.Checkers = []detect.Checker{awaitingChecker{onAwait: cancel}, stubChecker{fired: true}}
+	rec, err := e.Apply(ctx, context.Background(), w.tgt, w.open(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Telemetry.Status != "observed" || rec.Telemetry.Error != "" {
+		t.Fatalf("telemetry %+v; the drain runs after every expectation is met and must not touch it", rec.Telemetry)
+	}
+	if len(rec.Detections) != 2 {
+		t.Fatalf("detections %+v", rec.Detections)
+	}
+	d := rec.Detections[0]
+	if d.Status != detect.StatusError || d.Fired != nil || !strings.HasPrefix(d.Error, "telemetry collection was interrupted") {
+		t.Fatalf("detection %+v; want an unproven not-fired reported as an error", d)
+	}
+	if other := rec.Detections[1]; other.Fired == nil || !*other.Fired {
+		t.Fatalf("a non-Awaiter's result must be left alone: %+v", other)
+	}
+	if rec.Verdict == report.VerdictDetectionMissing {
+		t.Fatalf("verdict %s (%s): an interrupted drain is no detection gap", rec.Verdict, rec.Reason)
+	}
+	if !rec.Finished.Equal(rec.Started) {
+		t.Fatalf("collection took %s after the interrupt; want it to stop at once", rec.Finished.Sub(rec.Started))
+	}
+}
+
+// TestDrainEndingOnAnAuditFailureIsNotADetectionGap: when the audit API
+// fails from the moment the expectations resolve, the drain never reads the
+// log again, so "did not fire" is as unproven as after an interrupt. The
+// telemetry stays observed with no error; the detection is reported as an
+// error naming the audit API failure, fired is null, and the verdict is not
+// detection-missing. The drain still ends after DrainPolls poll intervals.
+func TestDrainEndingOnAnAuditFailureIsNotADetectionGap(t *testing.T) {
+	w := newWorld(t, nil)
+	p := w.plan("fake.persistence.mfa-factor-register")
+	e := w.engine(nil)
+	e.Checkers = []detect.Checker{awaitingChecker{onAwait: func() { w.store.failReads = true }}, stubChecker{fired: true}}
+	rec, err := e.Apply(context.Background(), context.Background(), w.tgt, w.open(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Telemetry.Status != "observed" || rec.Telemetry.Error != "" {
+		t.Fatalf("telemetry %+v; a failed drain poll must not touch it", rec.Telemetry)
+	}
+	if len(rec.Detections) != 2 {
+		t.Fatalf("detections %+v", rec.Detections)
+	}
+	d := rec.Detections[0]
+	const want = "the audit API failed on the last drain poll (503 service unavailable) while waiting for an event this rule may key on, so not firing is unproven"
+	if d.Status != detect.StatusError || d.Fired != nil || d.Error != want {
+		t.Fatalf("detection %+v; want an unproven not-fired reported as error %q", d, want)
+	}
+	if other := rec.Detections[1]; other.Fired == nil || !*other.Fired {
+		t.Fatalf("a non-Awaiter's result must be left alone: %+v", other)
+	}
+	if rec.Verdict == report.VerdictDetectionMissing {
+		t.Fatalf("verdict %s (%s): a drain that could not read the audit log is no detection gap", rec.Verdict, rec.Reason)
+	}
+	if got, want := rec.Finished.Sub(rec.Started), telemetry.DrainPolls*w.prov.Audit().PollInterval; got != want {
+		t.Fatalf("collection took %s; want the drain bounded at %s", got, want)
 	}
 }
 
