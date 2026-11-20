@@ -361,13 +361,13 @@ func (roleAssign) Spec() provider.Spec {
 			{Name: "role", Type: provider.ParamEnum, Enum: adminRoles, Example: "READ_ONLY_ADMIN", Required: true, Doc: "The admin role type."},
 		},
 		Outputs:     []string{"role"},
-		Scopes:      []string{scopeRolesMgmt, scopeUsersMgmt},
+		Scopes:      []string{scopeRolesMgmt},
 		Events:      []string{"user.account.privilege.grant"},
 		UndoEvents:  []string{"user.account.privilege.revoke"},
 		Request:     "POST /api/v1/users/{user}/roles",
 		UndoSummary: "revoke the role assignment",
 		GoneCheck:   "GET /api/v1/users/{user}/roles -> the role is not assigned",
-		Note:        "SUPER_ADMIN needs the tool's own profile to hold Super Admin",
+		Note:        "SUPER_ADMIN needs the service app to hold Super Admin",
 	}
 }
 

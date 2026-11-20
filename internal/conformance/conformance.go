@@ -12,7 +12,9 @@
 //   - Sweep finds what the op created;
 //   - Undo then Gone proves the object gone (or the prior value restored);
 //   - Undo on an already-undone object succeeds;
-//   - the tenant ends exactly as it started.
+//   - the tenant ends exactly as it started;
+//   - for a provider whose credential is scoped per session, the scopes an
+//     op declares are enough to run it, undo it and prove it gone.
 package conformance
 
 import (
@@ -39,6 +41,14 @@ type Harness struct {
 	Snapshot func(t *testing.T) json.RawMessage
 	// Version is the tool version used in User-Agents.
 	Version string
+	// Scoped, if set, opens another connection to the tenant NewTenant last
+	// returned, whose credential carries only the given scopes (see
+	// provider.Config.Scopes). The suite then runs each op, its setup, Do,
+	// Prior, Locate, Undo and Gone, and reads its audit events, through a
+	// connection limited to the scopes the op and its setup declare plus the
+	// audit source's: the declared scopes are what the core will ask for, so
+	// they must be enough. Sweep still runs on the NewTenant connection.
+	Scoped func(t *testing.T, scopes []string) provider.Tenant
 }
 
 // Run runs the whole suite.
@@ -62,6 +72,12 @@ type created struct {
 func runOp(t *testing.T, h Harness, reg *provider.Registry, e *provider.Entry) {
 	tenant, info := h.NewTenant(t)
 	before := h.Snapshot(t)
+	// sweeper lists the tenant; tenant runs the op. They differ only when the
+	// harness can narrow a connection to the op's declared scopes.
+	sweeper := tenant
+	if h.Scoped != nil {
+		tenant = h.Scoped(t, declaredScopes(reg, h.Provider, e))
+	}
 	run, err := marker.NewRunID()
 	if err != nil {
 		t.Fatal(err)
@@ -146,7 +162,7 @@ func runOp(t *testing.T, h Harness, reg *provider.Registry, e *provider.Entry) {
 				t.Errorf("Locate(%q) = found=%v err=%v; Locate must match the exact name only", near, ok, err)
 			}
 		}
-		orphans, err := tenant.Sweep(cctx, marker.RunPrefix(run)+"-")
+		orphans, err := sweeper.Sweep(cctx, marker.RunPrefix(run)+"-")
 		if err != nil {
 			t.Fatalf("Sweep: %v", err)
 		}
@@ -185,12 +201,42 @@ func runOp(t *testing.T, h Harness, reg *provider.Registry, e *provider.Entry) {
 			t.Fatalf("teardown %s: gone = %v, %v", d.entry.Spec.Name, gone, err)
 		}
 	}
-	if left, err := tenant.Sweep(cctx, marker.RunPrefix(run)+"-"); err != nil || len(left) != 0 {
+	if left, err := sweeper.Sweep(cctx, marker.RunPrefix(run)+"-"); err != nil || len(left) != 0 {
 		t.Errorf("after teardown Sweep = %+v, %v; want nothing left", left, err)
 	}
 	if after := h.Snapshot(t); string(after) != string(before) {
 		t.Errorf("the tenant is not as the op found it:\nbefore %s\nafter  %s", before, after)
 	}
+}
+
+// declaredScopes is what running e needs by declaration: its own scopes, those
+// of every op the suite runs to build its ref parameters, and the audit
+// source's.
+func declaredScopes(reg *provider.Registry, p provider.Provider, e *provider.Entry) []string {
+	set := map[string]bool{}
+	for _, s := range p.Audit().Scopes {
+		set[s] = true
+	}
+	var walk func(entry *provider.Entry)
+	walk = func(entry *provider.Entry) {
+		for _, s := range entry.Spec.Scopes {
+			set[s] = true
+		}
+		for _, prm := range entry.Spec.Params {
+			if prm.Type == provider.ParamRef {
+				if dep := producer(reg, prm.Ref); dep != nil {
+					walk(dep)
+				}
+			}
+		}
+	}
+	walk(e)
+	out := make([]string, 0, len(set))
+	for s := range set {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // producer returns the first create op (by name) producing resource.

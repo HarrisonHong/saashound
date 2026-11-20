@@ -14,11 +14,8 @@ func (s *Server) routeUsers(w http.ResponseWriter, r *http.Request, st *State, u
 	case len(seg) == 0 && r.Method == http.MethodPost:
 		s.createUser(w, r, st, ua)
 	case len(seg) == 1 && seg[0] == "me" && r.Method == http.MethodGet:
-		if u := s.meUser(st); u != nil {
-			writeJSON(w, 200, u)
-		} else {
-			writeErr(w, 404, "E0000007", "token user not found")
-		}
+		// A client credentials token has no user behind it.
+		writeErr(w, 404, "E0000007", "Not found: Resource not found: me (User)")
 	case len(seg) == 1 && r.Method == http.MethodGet:
 		if u := findUser(st, seg[0]); u != nil {
 			writeJSON(w, 200, u)
@@ -50,15 +47,6 @@ func (s *Server) routeUsers(w http.ResponseWriter, r *http.Request, st *State, u
 	default:
 		writeErr(w, 404, "E0000007", "user route not found")
 	}
-}
-
-func (s *Server) meUser(st *State) *User {
-	for _, u := range sortedUsers(st.Users) {
-		if u.Profile.Login == s.principal {
-			return u
-		}
-	}
-	return nil
 }
 
 func findUser(st *State, idOrLogin string) *User {

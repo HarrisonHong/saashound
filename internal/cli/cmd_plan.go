@@ -84,7 +84,9 @@ func (a *app) planCmd() *cobra.Command {
 		Long: `Show every call the run will make, every object it will create (with its
 name), the scopes needed, the expected events and deadlines, the cleanup
 order, and the guardrail result. plan makes only read calls (identity, the
-ownership marker, capabilities); --offline makes none.`,
+ownership marker, capabilities), on a connection asking for exactly the
+scopes apply would, so a credential that cannot get one is refused here;
+--offline makes none.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := a.corpus()
@@ -102,7 +104,9 @@ ownership marker, capabilities); --offline makes none.`,
 			guardLine := "not checked (--offline)"
 			var gerr error
 			if !offline {
-				ten, err := a.open(cmd.Context(), t, &tracer{p: a.progress})
+				// The same scopes apply would ask for, so a credential that
+				// cannot get one is refused here rather than mid-run.
+				ten, err := a.open(cmd.Context(), t, &tracer{p: a.progress}, access{scopes: runScopes(runs)})
 				if err != nil {
 					return err
 				}

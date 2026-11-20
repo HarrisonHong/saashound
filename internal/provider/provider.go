@@ -53,6 +53,29 @@ type Config struct {
 	// Secrets only when needed. It is zero when the target declares none.
 	Credential secret.Ref
 	Secrets    secret.Source
+	// Scopes are the permissions this connection's work needs, as the ops it
+	// may run and the audit source declare them (Spec.Scopes, AuditInfo.Scopes).
+	// The caller derives them from what it is about to do: the plan's scopes
+	// for plan and apply, the journalled ops' for cleanup. A provider whose
+	// credential can be narrowed per
+	// session (an OAuth client that mints a token per run) must request
+	// exactly these, plus whatever its own identity and marker reads need,
+	// and fail before any call if it cannot obtain one of them. A provider
+	// whose credential has fixed privileges may ignore them.
+	Scopes []string
+	// OptionalScopes are requested only if the credential can obtain them,
+	// and silently left out otherwise; Whoami's Identity.Scopes then says
+	// which were obtained. auth uses them to report, in one read-only session,
+	// which scopes the corpus needs that the credential cannot get; sweep asks
+	// for the whole op vocabulary's this way. A provider that then cannot see
+	// some kind of object it would sweep must refuse rather than report the
+	// tenant clean.
+	OptionalScopes []string
+	// ReadOnly says the connection will make only read calls (sweep without
+	// --delete). A provider that narrows its credential per session should
+	// then ask for the read-only counterparts of the scopes, where its
+	// platform has them.
+	ReadOnly bool
 	// StateDir is a private directory the provider may use for local state.
 	// Real platforms should not need it; the simulated provider keeps its
 	// tenant there.
@@ -119,7 +142,12 @@ type Identity struct {
 	Domain      string   `json:"domain"`
 	ShortName   string   `json:"short_name"` // what the operator types to confirm
 	Roles       []string `json:"roles,omitempty"`
-	Scopes      []string `json:"scopes,omitempty"`
+	// Scopes are the scopes the credential carries in this session.
+	Scopes []string `json:"scopes,omitempty"`
+	// Credential describes, for display, how the credential authenticates,
+	// for example "OAuth 2.0 service app (private_key_jwt)". It never holds
+	// any part of the credential itself.
+	Credential string `json:"credential,omitempty"`
 	// ActiveUsers is the tenant's active user count, or -1 if unknown.
 	ActiveUsers int `json:"active_users"`
 }

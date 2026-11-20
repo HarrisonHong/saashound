@@ -114,7 +114,12 @@ func (a *app) cleanupRun(cmd *cobra.Command, run string) (code int, abandoned bo
 
 	tr := &tracer{p: a.progress}
 	tr.setRun(run)
-	ten, err := a.open(cmd.Context(), t, tr)
+	// Undoing the run needs exactly the scopes of the ops it journalled.
+	ops := make([]string, 0, len(j.Header.Steps))
+	for _, s := range j.Header.Steps {
+		ops = append(ops, s.Op)
+	}
+	ten, err := a.open(cmd.Context(), t, tr, access{scopes: a.opScopes(ops)})
 	if err != nil {
 		return 0, false, err
 	}
@@ -218,7 +223,13 @@ Exit 0 when nothing is left behind, 3 otherwise.`, marker.Prefix),
 			}
 			defer lock.Unlock()
 			tr := &tracer{p: a.progress}
-			ten, err := a.open(cmd.Context(), t, tr)
+			// Sweep lists every kind of object the platform's create ops
+			// make, and with --delete may remove any of them, so it asks for
+			// those ops' scopes (read-only without --delete), but only those
+			// the credential can get: an operator may withhold the scopes of
+			// techniques they never run. A provider that then cannot see some
+			// kind of object refuses rather than report the tenant clean.
+			ten, err := a.open(cmd.Context(), t, tr, access{optional: a.sweepScopes(t.Platform), readOnly: !del})
 			if err != nil {
 				return err
 			}

@@ -58,7 +58,7 @@ func TestOktaKilledProcessRecovers(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.technique+"/"+c.step+"/"+string(c.point), func(t *testing.T) {
 			dir := t.TempDir()
-			srv := mockokta.New(mockokta.WithToken(oktaToken), mockokta.WithPrincipal(oktaPrincipal))
+			srv := mockokta.New()
 			defer srv.Close()
 			targetsPath := filepath.Join(dir, "targets.yaml")
 			stateDir := filepath.Join(dir, "state")
@@ -68,8 +68,8 @@ func TestOktaKilledProcessRecovers(t *testing.T) {
 				var out bytes.Buffer
 				env := cli.Env{Stdout: &out, Stderr: &out, Clock: clock.Real{}, Registry: provider.Default,
 					Getenv: func(k string) string {
-						if k == "OKTA_TOKEN" {
-							return oktaToken
+						if k == oktaKeyEnv {
+							return oktaKey()
 						}
 						return ""
 					}}
@@ -78,10 +78,10 @@ func TestOktaKilledProcessRecovers(t *testing.T) {
 			}
 
 			if out, code := parent("init", "okta", "--platform", "okta", "--tenant", srv.URL(),
-				"--principal", oktaPrincipal, "--test-domain", "lab.example.com", "--credential-env", "OKTA_TOKEN"); code != 0 {
+				"--principal", srv.ClientID(), "--test-domain", "lab.example.com", "--credential-env", oktaKeyEnv); code != 0 {
 				t.Fatalf("init: %d %s", code, out)
 			}
-			tgt := &target.Target{Name: "okta", Platform: "okta", Tenant: srv.URL(), Principal: oktaPrincipal, Environment: "lab"}
+			tgt := &target.Target{Name: "okta", Platform: "okta", Tenant: srv.URL(), Principal: srv.ClientID(), Environment: "lab"}
 			srv.PlaceMarker(marker.AuthorizationName, tgt.MarkerValue())
 			before := srv.Snapshot()
 
@@ -91,7 +91,7 @@ func TestOktaKilledProcessRecovers(t *testing.T) {
 			cmd.Env = append(os.Environ(),
 				helperArgs+"="+string(args),
 				helperPoint+"="+string(c.point), helperStep+"="+c.step, helperRun+"="+run,
-				"OKTA_TOKEN="+oktaToken)
+				oktaKeyEnv+"="+oktaKey())
 			var out bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &out, &out
 			err := cmd.Run()

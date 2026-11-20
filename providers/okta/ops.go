@@ -41,17 +41,37 @@ const (
 	resResourceSet = "okta.resource_set"
 )
 
-// Okta OAuth scopes / admin permissions, declared per op for the plan and the
-// `auth` scope check. They document least privilege; techniques that assign
-// Super Admin or grant app scopes need a Super Admin profile (see the README).
+// Okta OAuth 2.0 scopes. Each op declares exactly the scopes its calls need,
+// per Okta's Management API reference, and they are load-bearing: a session's
+// access token is minted with the scopes of the ops it may run (plus the
+// read-only baseScopes), so an op that under-declares fails with 403, which
+// the scope-limited conformance run against the mock org catches. The
+// service app's admin role still bounds what a scope allows: techniques that
+// assign Super Admin or grant API scopes need the app to hold Super Admin
+// (see the README).
 const (
-	scopeLogsRead   = "okta.logs.read"
-	scopeUsersMgmt  = "okta.users.manage"
-	scopeRolesMgmt  = "okta.roles.manage"
-	scopeZonesMgmt  = "okta.networkZones.manage"
-	scopeIdpsMgmt   = "okta.idps.manage"
-	scopeAppsMgmt   = "okta.apps.manage"
-	scopePolicyMgmt = "okta.policies.manage"
+	scopeLogsRead      = "okta.logs.read"
+	scopeOrgsRead      = "okta.orgs.read"
+	scopeUsersRead     = "okta.users.read"
+	scopeUsersMgmt     = "okta.users.manage"
+	scopeGroupsRead    = "okta.groups.read"
+	scopeRolesMgmt     = "okta.roles.manage"
+	scopeZonesMgmt     = "okta.networkZones.manage"
+	scopeIdpsMgmt      = "okta.idps.manage"
+	scopeAppsMgmt      = "okta.apps.manage"
+	scopeAppGrantsMgmt = "okta.appGrants.manage"
+	scopePolicyMgmt    = "okta.policies.manage"
+)
+
+// Scope families: a family's .manage scope implies its .read scope. Sweep
+// lists each family it can create objects in.
+const (
+	familyUsers        = "okta.users"
+	familyRoles        = "okta.roles"
+	familyApps         = "okta.apps"
+	familyIdps         = "okta.idps"
+	familyNetworkZones = "okta.networkZones"
+	familyPolicies     = "okta.policies"
 )
 
 // adminRoles is the closed set of Okta admin role types the role op may grant.

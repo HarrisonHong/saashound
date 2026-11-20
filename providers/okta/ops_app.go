@@ -106,13 +106,13 @@ func (appGrantScope) Spec() provider.Spec {
 			{Name: "app", Type: provider.ParamRef, Ref: resApp, Required: true, Doc: "The service app to grant the scope to."},
 			{Name: "scope", Type: provider.ParamEnum, Enum: appScopes, Example: "okta.users.read", Required: true, Doc: "The Okta API scope."},
 		},
-		Scopes:      []string{scopeAppsMgmt},
+		Scopes:      []string{scopeAppGrantsMgmt},
 		Events:      []string{"app.oauth2.client.privilege.grant"},
 		UndoEvents:  []string{"app.oauth2.client.privilege.revoke"},
 		Request:     "POST /api/v1/apps/{app}/grants",
 		UndoSummary: "revoke the scope grant",
 		GoneCheck:   "GET /api/v1/apps/{app}/grants -> the scope is not granted",
-		Note:        "granting Okta API scopes needs the tool's own profile to hold Super Admin",
+		Note:        "granting Okta API scopes needs the service app to hold Super Admin",
 	}
 }
 

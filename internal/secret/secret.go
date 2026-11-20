@@ -4,8 +4,9 @@
 //
 // Every formatting path of Value (fmt verbs, JSON, text, slog) yields
 // "[redacted]". The raw bytes are reachable only through Reveal, and a policy
-// test restricts which files may call it: provider transports, which set an
-// Authorization header, and nothing else.
+// test restricts which files may call it: provider transports, which turn a
+// credential into a request's authentication (an Authorization header, or a
+// signed OAuth client assertion and the token it buys), and nothing else.
 package secret
 
 import (

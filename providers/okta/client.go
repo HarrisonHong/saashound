@@ -3,11 +3,13 @@
 // Whoami, the ownership marker and Sweep) for one Okta org.
 //
 // The client is deliberately small and uniform: every request carries the
-// run's User-Agent marker, authenticates with the operator's SSWS token
-// through transport.go (the only place the raw token is read), backs off on
-// Okta's 429 rate limiting, follows Link-header pagination, and never logs or
-// returns a credential or a response body. Only the method, path, status and
-// latency of a call are ever traced.
+// run's User-Agent marker, authenticates with the session's short-lived OAuth
+// 2.0 access token through transport.go (the only place a raw credential is
+// read; it mints the token with the service app's private key), backs off on
+// Okta's 429 rate limiting, follows Link-header pagination on the org's own
+// host only, never follows a redirect, and never logs or returns a credential
+// or a response body. Only the method, path, status and latency of a call are
+// ever traced.
 package okta
 
 import (
@@ -101,19 +103,19 @@ func isLoopback(host string) bool {
 	return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
 }
 
-// newClient builds a client for base, authenticating with token through the
-// auth transport. It makes no network call.
+// newClient builds a client for base, authenticating through the auth
+// transport. It makes no network call.
 func newClient(base *url.URL, auth *authTransport, clk clock.Clock, trace func(provider.Request)) *client {
 	return &client{
 		base:  base,
-		http:  &http.Client{Transport: auth, Timeout: 60 * time.Second},
+		http:  &http.Client{Transport: auth, Timeout: 60 * time.Second, CheckRedirect: noRedirects},
 		auth:  auth,
 		clk:   clk,
 		trace: trace,
 	}
 }
 
-// close releases the client and scrubs the token.
+// close releases the client and scrubs the key and the token.
 func (c *client) close() { c.auth.wipe() }
 
 // get, post, put and del are the verb-shaped conveniences ops call.
@@ -171,8 +173,12 @@ func (c *client) doURL(ctx context.Context, method, rawURL string, body, out any
 // send performs one request, retrying Okta's 429 rate limiting at most
 // maxRateLimitRetries times. It is the single place a request is issued, so
 // every caller shares the same bound: a 429 that outlasts the retries is
-// returned as the response for the caller to finish into an apiError.
+// returned as the response for the caller to finish into an apiError. A 401
+// means the org no longer accepts the session's token (it was revoked, or
+// expired early): the request was not processed, so it is retried once on a
+// freshly minted token.
 func (c *client) send(ctx context.Context, method, rawURL string, encoded []byte) (*http.Response, error) {
+	reauthed := false
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -195,9 +201,21 @@ func (c *client) send(ctx context.Context, method, rawURL string, encoded []byte
 
 		resp, err := c.http.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("okta: %s %s: %w", method, redactPath(rawURL), err)
+			var ae *authError
+			if errors.As(err, &ae) {
+				return nil, ae // a credential problem, already explained
+			}
+			return nil, fmt.Errorf("okta: %s %s: %w", method, redactPath(rawURL), unwrapURLError(err))
 		}
 		c.traceReq(method, rawURL, resp.StatusCode, c.clk.Now().Sub(start))
+
+		if resp.StatusCode == http.StatusUnauthorized && !reauthed {
+			reauthed = true
+			_ = drainClose(resp.Body)
+			c.auth.src.invalidate()
+			attempt-- // not a rate-limit retry
+			continue
+		}
 
 		if resp.StatusCode != http.StatusTooManyRequests || attempt >= maxRateLimitRetries {
 			return resp, nil

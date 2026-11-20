@@ -5,7 +5,7 @@ description: >
   an account they control. This creates a synthetic user (no usable
   credential), grants it the SUPER_ADMIN role, and expects the privilege-grant
   event. Cleanup revokes the role and removes the user. Granting SUPER_ADMIN
-  requires the tool's own token to hold Super Admin.
+  requires the tool's service app to hold Super Admin.
 author: [saashound-maintainers]
 platform: okta
 attack: [T1098.003]

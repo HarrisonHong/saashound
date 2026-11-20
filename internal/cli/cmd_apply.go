@@ -80,7 +80,8 @@ Exit codes: 0 every expectation met, 1 an expectation failed, 2 refused,
 			defer lock.Unlock()
 
 			tr := &tracer{p: a.progress}
-			ten, err := a.open(cmd.Context(), t, tr)
+			// The connection asks for exactly what these runs need.
+			ten, err := a.open(cmd.Context(), t, tr, access{scopes: runScopes(runs)})
 			if err != nil {
 				return err
 			}

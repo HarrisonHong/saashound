@@ -22,11 +22,17 @@ type actor struct {
 	DisplayName string `json:"displayName"`
 }
 
-// emit appends one System Log event with the request's User-Agent, the way
-// Okta records client.userAgent.rawUserAgent for the request that caused it.
-// A dropped event type is silently not logged (a platform coverage gap); a
-// lagged one is published now but not visible to /logs until later.
+// emit appends one System Log event for a call the service app made, with the
+// request's User-Agent, the way Okta records client.userAgent.rawUserAgent for
+// the request that caused it.
 func (s *Server) emit(st *State, ua, eventType, message string, targets ...target) {
+	s.emitAs(st, s.appActor(), ua, eventType, message, targets...)
+}
+
+// emitAs appends one System Log event performed by a. A dropped event type is
+// silently not logged (a platform coverage gap); a lagged one is published now
+// but not visible to /logs until later.
+func (s *Server) emitAs(st *State, a actor, ua, eventType, message string, targets ...target) {
 	if s.drop[eventType] {
 		return
 	}
@@ -35,7 +41,6 @@ func (s *Server) emit(st *State, ua, eventType, message string, targets ...targe
 	if d, ok := s.lagByType[eventType]; ok {
 		lag = d
 	}
-	a := s.tokenActor(st)
 	if targets == nil {
 		targets = []target{}
 	}
@@ -57,14 +62,20 @@ func (s *Server) emit(st *State, ua, eventType, message string, targets ...targe
 	st.Log = append(st.Log, LogEntry{VisibleAt: now.Add(lag), Event: b})
 }
 
-// tokenActor is the token's user, the actor Okta attributes an SSWS action to.
-func (s *Server) tokenActor(st *State) actor {
+// appActor is the service app, the actor Okta attributes a call made with
+// its access token to.
+func (s *Server) appActor() actor {
+	return actor{ID: s.app.clientID, Type: "PublicClientApp", AlternateID: s.app.clientID, DisplayName: s.app.label}
+}
+
+// adminActor is the seeded human admin, acting in the Admin Console.
+func (s *Server) adminActor(st *State) actor {
 	for _, u := range sortedUsers(st.Users) {
-		if u.Profile.Login == s.principal {
-			return actor{ID: u.ID, Type: "User", AlternateID: u.Profile.Login, DisplayName: "Mock Bot"}
+		if u.Profile.Login == AdminLogin {
+			return actor{ID: u.ID, Type: "User", AlternateID: u.Profile.Login, DisplayName: "Mock Admin"}
 		}
 	}
-	return actor{ID: "unknown", Type: "User", AlternateID: s.principal, DisplayName: s.principal}
+	return actor{ID: "unknown", Type: "User", AlternateID: AdminLogin, DisplayName: AdminLogin}
 }
 
 // routeLogs serves GET /api/v1/logs, filtered to the since/until window and to

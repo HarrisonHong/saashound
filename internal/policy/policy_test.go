@@ -136,7 +136,8 @@ func TestNoListener(t *testing.T) {
 }
 
 // A raw credential is readable in exactly one kind of place: a provider's
-// transport, which sets the Authorization header.
+// transport, which turns it into a request's authentication (the
+// Authorization header, or the OAuth client assertion that mints the token).
 func TestRevealOnlyInTransports(t *testing.T) {
 	calls := 0
 	for _, f := range sources(t) {

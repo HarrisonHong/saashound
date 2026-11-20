@@ -147,8 +147,14 @@ func (a *app) authCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			need, needErr := a.corpusScopes(t.Platform)
+			p, _ := a.reg.Provider(t.Platform)
 			tr := &tracer{p: a.progress}
-			ten, err := a.open(cmd.Context(), t, tr)
+			// auth only reads (identity, marker, capabilities, the audit
+			// API), so it requires just the audit scopes. It asks for the rest
+			// of what the corpus needs optionally, only to report which of
+			// them the credential cannot get.
+			ten, err := a.open(cmd.Context(), t, tr, access{scopes: p.Audit().Scopes, optional: need})
 			if err != nil {
 				return err
 			}
@@ -156,14 +162,21 @@ func (a *app) authCmd() *cobra.Command {
 			rep, gerr := guard.Check(cmd.Context(), guard.Request{Mode: guard.ModePlan, Target: t, Tenant: ten})
 			out := cmd.OutOrStdout()
 			id := rep.Identity
-			fmt.Fprintf(out, "%s   %s   %s   %q\n", t.Name, t.Platform, orDash(id.Domain), id.DisplayName)
+			head := fmt.Sprintf("%s   %s   %s", t.Name, t.Platform, orDash(id.Domain))
+			if id.DisplayName != "" {
+				head += fmt.Sprintf("   %q", id.DisplayName)
+			}
+			fmt.Fprintln(out, head)
 			fmt.Fprintf(out, "  principal   %s\n", orDash(id.Principal))
+			if id.Credential != "" {
+				fmt.Fprintf(out, "  credential  %s\n", id.Credential)
+			}
 			if len(id.Roles) > 0 {
 				fmt.Fprintf(out, "  roles       %s\n", strings.Join(id.Roles, " "))
 			}
 			if len(id.Scopes) > 0 {
 				line := fmt.Sprintf("%d granted", len(id.Scopes))
-				if need, err := a.corpusScopes(t.Platform); err == nil {
+				if needErr == nil {
 					line += fmt.Sprintf(", %d needed by the %s corpus", len(need), t.Platform)
 					if missing := missingScopes(need, id.Scopes); len(missing) > 0 {
 						line += "; MISSING " + strings.Join(missing, " ")

@@ -1,6 +1,7 @@
 package mockokta
 
 import (
+	"crypto"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,27 +15,37 @@ import (
 type Server struct {
 	http      *httptest.Server
 	g         *guarded
-	token     string
-	principal string
 	now       func() time.Time
 	lag       time.Duration
 	lagByType map[string]time.Duration
 	drop      map[string]bool
 
-	// fail429 makes the next n API calls answer 429, to exercise the client's
-	// rate-limit backoff. Guarded by g.mu.
-	fail429 int
+	// app is the API Services app the tool authenticates as; customKeys
+	// records that WithClientKey replaced its default key.
+	app        serviceApp
+	customKeys bool
+	tokenTTL   time.Duration
+
+	// The rest is guarded by g.mu.
+
+	// tokens are the access tokens issued, by value; issued is the same in
+	// issue order.
+	tokens map[string]*accessToken
+	issued []*accessToken
+	// jtis are the client assertion IDs already used.
+	jtis map[string]bool
+	// credentials are every access token issued and every client assertion
+	// received, for canary tests.
+	credentials []string
+	// fail429 makes the next n API calls answer 429, and failToken429 the
+	// next n token or introspection requests, to exercise the client's
+	// rate-limit backoff.
+	fail429      int
+	failToken429 int
 }
 
 // Option configures a Server.
 type Option func(*Server)
-
-// WithToken sets the SSWS token the org accepts. The default is "mock-token".
-func WithToken(tok string) Option { return func(s *Server) { s.token = tok } }
-
-// WithPrincipal sets the login of the token's user (what /users/me returns and
-// the guardrail matches against the target's principal).
-func WithPrincipal(login string) Option { return func(s *Server) { s.principal = login } }
 
 // WithClock makes event timestamps and log visibility follow now, so tests on
 // a fake clock see events inside their query window.
@@ -53,26 +64,44 @@ func WithDrop(eventType string) Option {
 	return func(s *Server) { s.drop[eventType] = true }
 }
 
-// New starts a mock org seeded with the token's user (so /users/me and the
-// guardrail work) and nothing else. Close it when done.
+// New starts a mock org seeded with one human Super Admin and the API
+// Services app the tool authenticates as: client ID DefaultClientID, the
+// public half of DefaultKey registered, every Okta API scope granted and the
+// Super Admin role assigned, all adjustable with options. Close it when done.
 func New(opts ...Option) *Server {
 	s := &Server{
 		g:         &guarded{s: newState()},
-		token:     "mock-token",
-		principal: "okta-bot@example.com",
 		now:       time.Now,
 		lagByType: map[string]time.Duration{},
 		drop:      map[string]bool{},
+		app: serviceApp{
+			clientID: DefaultClientID,
+			label:    "SaaSHound",
+			granted:  map[string]bool{},
+			roles:    []string{"SUPER_ADMIN"},
+		},
+		tokenTTL: time.Hour,
+		tokens:   map[string]*accessToken{},
+		jtis:     map[string]bool{},
+	}
+	for _, sc := range allScopes {
+		s.app.granted[sc] = true
 	}
 	for _, o := range opts {
 		o(s)
 	}
+	if !s.customKeys {
+		k := DefaultKey()
+		s.app.keys = map[string]crypto.PublicKey{k.ID: k.Public()}
+	}
 	st := s.g.s
 	st.Org = Org{ID: st.newID("00o"), Subdomain: "dev-mock", CompanyName: "Mock Org", Status: statusActive}
-	me := &User{ID: st.newID("00u"), Status: statusActive, Created: s.now().UTC(),
-		Profile: UserProfile{Login: s.principal, Email: s.principal, FirstName: "Mock", LastName: "Bot"}}
-	st.Users[me.ID] = me
-	st.Roles[st.newID("ra")] = &RoleAssignment{ID: "sysadmin", Type: "SUPER_ADMIN", Status: statusActive, userID: me.ID}
+	admin := &User{ID: st.newID("00u"), Status: statusActive, Created: s.now().UTC(),
+		Profile: UserProfile{Login: AdminLogin, Email: AdminLogin, FirstName: "Mock", LastName: "Admin"}}
+	st.Users[admin.ID] = admin
+	st.Roles[st.newID("ra")] = &RoleAssignment{ID: "sysadmin", Type: "SUPER_ADMIN", Status: statusActive, userID: admin.ID}
+	// The service app is an app in the org like any other.
+	st.Apps[s.app.clientID] = &App{ID: s.app.clientID, Name: "oidc_client", Label: s.app.label, Status: statusActive, SignOnMode: "OPENID_CONNECT"}
 	s.http = httptest.NewServer(http.HandlerFunc(s.serve))
 	return s
 }
@@ -118,7 +147,7 @@ func (s *Server) PlaceMarker(name, value string) {
 	}
 	g := &Group{ID: st.newID("00g"), Type: "OKTA_GROUP", Profile: GroupProfile{Name: name, Description: value}}
 	st.Groups[g.ID] = g
-	s.emit(st, "Mozilla/5.0 (X11; Linux x86_64)", "group.lifecycle.create", "Add group",
+	s.emitAs(st, s.adminActor(st), "Mozilla/5.0 (X11; Linux x86_64)", "group.lifecycle.create", "Add group",
 		target{ID: g.ID, Type: "UserGroup", DisplayName: name})
 }
 
@@ -143,35 +172,58 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	}
 }
 
-// serve routes one request. Every mutating handler runs under g.mu and records
-// its System Log event with the request's User-Agent.
+// serve routes one request. Every request runs under g.mu. The OAuth
+// endpoints authenticate the app by its client assertion; every other call
+// needs a valid access token carrying the scope its endpoint requires, and an
+// app holding an admin role, as a real org's do. Every mutating handler
+// records its System Log event with the request's User-Agent.
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.g.mu.Lock()
+	defer s.g.mu.Unlock()
+	if r.URL.Path == tokenPath || r.URL.Path == introspectPath {
+		s.serveOAuth(w, r)
+		return
+	}
 	if s.fail429 > 0 {
 		s.fail429--
 		reset := s.now().Add(time.Second).Unix()
-		s.g.mu.Unlock()
 		w.Header().Set("X-Rate-Limit-Limit", "600")
 		w.Header().Set("X-Rate-Limit-Remaining", "0")
 		w.Header().Set("X-Rate-Limit-Reset", strconv.FormatInt(reset, 10))
 		writeErr(w, http.StatusTooManyRequests, "E0000047", "API call exceeded rate limit")
 		return
 	}
-	s.g.mu.Unlock()
-
-	// SSWS token auth: the one credential check, as a real org's does.
-	auth := r.Header.Get("Authorization")
-	if auth != "SSWS "+s.token {
-		writeErr(w, http.StatusUnauthorized, "E0000011", "Invalid token provided")
+	at, ok := s.bearer(r)
+	if !ok {
+		writeInvalidToken(w)
 		return
 	}
-	ua := r.Header.Get("User-Agent")
-
-	s.g.mu.Lock()
-	defer s.g.mu.Unlock()
-	st := s.g.s
+	if rest, ok := strings.CutPrefix(r.URL.Path, "/oauth2/v1/clients/"); ok {
+		s.routeClients(w, r, at, strings.Split(rest, "/"))
+		return
+	}
+	if !strings.HasPrefix(r.URL.Path, "/api/v1/") {
+		writeErr(w, 404, "E0000007", "Not found: "+r.URL.Path)
+		return
+	}
 	seg := splitPath(r.URL.Path)
-	s.route(w, r, st, ua, seg)
+	if family, manage := requiredScope(r.Method, seg); family != "" {
+		if !at.allows(family, manage) {
+			level := ".read"
+			if manage {
+				level = ".manage"
+			}
+			writeInsufficientScope(w, family+level)
+			return
+		}
+		if len(s.app.roles) == 0 {
+			// A service app's scopes are bounded by its admin roles; with
+			// none, it may do nothing.
+			writeErr(w, http.StatusForbidden, "E0000006", "You do not have permission to perform the requested action")
+			return
+		}
+	}
+	s.route(w, r, s.g.s, r.Header.Get("User-Agent"), seg)
 }
 
 // splitPath returns the non-empty path segments after /api/v1.

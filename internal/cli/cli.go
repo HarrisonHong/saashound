@@ -28,6 +28,7 @@ import (
 	"github.com/HarrisonHong/saashound/internal/detect/sigma"
 	"github.com/HarrisonHong/saashound/internal/engine"
 	"github.com/HarrisonHong/saashound/internal/guard"
+	"github.com/HarrisonHong/saashound/internal/plan"
 	"github.com/HarrisonHong/saashound/internal/provider"
 	"github.com/HarrisonHong/saashound/internal/report"
 	"github.com/HarrisonHong/saashound/internal/secret"
@@ -315,14 +316,73 @@ func (a *app) providerConfig(t *target.Target, tr *tracer) provider.Config {
 	return cfg
 }
 
-// open connects to a target's tenant.
-func (a *app) open(ctx context.Context, t *target.Target, tr *tracer) (provider.Tenant, error) {
+// access is what a command's connection asks its credential for (see
+// provider.Config.Scopes): a provider that mints a down-scoped token per
+// session never holds more than the command needs.
+type access struct {
+	// scopes must all be obtainable; optional ones only if they are.
+	scopes, optional []string
+	// readOnly says the command only reads.
+	readOnly bool
+}
+
+// open connects to a target's tenant with the given access.
+func (a *app) open(ctx context.Context, t *target.Target, tr *tracer, acc access) (provider.Tenant, error) {
 	p, _ := a.reg.Provider(t.Platform)
-	ten, err := p.Open(ctx, a.providerConfig(t, tr))
+	cfg := a.providerConfig(t, tr)
+	cfg.Scopes, cfg.OptionalScopes, cfg.ReadOnly = acc.scopes, acc.optional, acc.readOnly
+	ten, err := p.Open(ctx, cfg)
 	if err != nil {
 		return nil, refused("open target %s: %v", t.Name, err)
 	}
 	return ten, nil
+}
+
+// runScopes is every scope the planned runs need: their steps' ops and the
+// audit source they read.
+func runScopes(runs []*plan.Run) []string {
+	set := map[string]bool{}
+	for _, r := range runs {
+		for _, s := range r.Scopes {
+			set[s] = true
+		}
+	}
+	return sortedSet(set)
+}
+
+// opScopes is every scope the named ops need. An op this binary does not
+// register contributes nothing; whoever runs it reports that.
+func (a *app) opScopes(ops []string) []string {
+	set := map[string]bool{}
+	for _, name := range ops {
+		if e, ok := a.reg.Op(name); ok {
+			for _, s := range e.Spec.Scopes {
+				set[s] = true
+			}
+		}
+	}
+	return sortedSet(set)
+}
+
+// sweepScopes is every scope the platform's create ops need: sweep finds the
+// objects they create and removes each with its creating op.
+func (a *app) sweepScopes(platform string) []string {
+	var ops []string
+	for _, e := range a.reg.Ops(platform) {
+		if e.Spec.Kind == provider.KindCreate {
+			ops = append(ops, e.Spec.Name)
+		}
+	}
+	return a.opScopes(ops)
+}
+
+func sortedSet(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for s := range set {
+		out = append(out, s)
+	}
+	sortStrings(out)
+	return out
 }
 
 func (a *app) engine() *engine.Engine {

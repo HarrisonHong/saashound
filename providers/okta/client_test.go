@@ -24,7 +24,7 @@ func TestRateLimitBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Whoami did not survive rate limiting: %v", err)
 	}
-	if id.Principal != testPrincipal {
+	if id.Principal != srv.ClientID() {
 		t.Fatalf("principal %q", id.Principal)
 	}
 }
@@ -92,8 +92,9 @@ func TestPaginationFollowed(t *testing.T) {
 	}
 }
 
-// TestSweepIgnoresNonRunObjects proves the sweeper never offers the token's own
-// user or anything whose name is not a strict run-object name.
+// TestSweepIgnoresNonRunObjects proves the sweeper never offers the service app
+// itself, the org's admin, or anything whose name is not a strict run-object
+// name.
 func TestSweepIgnoresNonRunObjects(t *testing.T) {
 	srv, cfg := newMock(t)
 	srv.State(func(s *mockokta.State) {
@@ -110,10 +111,10 @@ func TestSweepIgnoresNonRunObjects(t *testing.T) {
 			t.Fatalf("sweep offered a non-run object: %q", o.Name)
 		}
 	}
-	// And the principal user is never swept.
+	// And neither the admin nor the app the tool authenticates as is swept.
 	for _, o := range orphans {
-		if o.Name == testPrincipal {
-			t.Fatal("sweep offered the token's own user")
+		if o.Name == mockokta.AdminLogin || o.Record.ID == srv.ClientID() || o.Name == "SaaSHound" {
+			t.Fatalf("sweep offered %q", o.Name)
 		}
 	}
 }

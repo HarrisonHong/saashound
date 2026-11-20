@@ -153,48 +153,79 @@ To try the slow paths, add options to the fake target in `targets.yaml`: `api_la
 
 ## Okta quick-start
 
-The Okta provider runs the same loop against a real Okta org you own (a free [Integrator](https://developer.okta.com/) org works). Three one-time steps, then it is identical to the simulated flow above.
+The Okta provider runs the same loop against a real Okta org you own (a free [Integrator](https://developer.okta.com/) org works). It authenticates as an **OAuth 2.0 API Services app** using `private_key_jwt`, and holds no standing API token: each run signs a single-use assertion, valid for five minutes, with the app's private key and exchanges it at the org's token endpoint for an access token that carries **only the scopes that run's plan needs** and expires within the hour. The token lives in memory, goes to the org and nowhere else, and is never written down. (SSWS API tokens are not supported: they inherit every privilege of the admin who created them and cannot be narrowed per run.) Four one-time steps, then it is identical to the simulated flow above.
 
-**1. Create an org-owned API token.** In the Okta Admin Console, go to **Security → API → Tokens → Create Token**. Okta cannot mint tokens over the API, so the operator supplies one; an SSWS token inherits the privileges of the admin who creates it, so sign in as a **dedicated service account** and give it a **custom admin role** scoped to only what the techniques you run need, rather than Super Admin. (Granting Super Admin to a user, or API scopes to a service app, does need the token's own account to hold Super Admin; those techniques are noted in `saashound show`.) Put the token in an environment variable or a `0600` file - never a flag:
+**1. Create the service app.** In the Okta Admin Console, go to **Applications → Applications → Create App Integration → API Services** and name it, for example `SaaSHound`. On its **General** tab:
 
-```sh
-export OKTA_TOKEN='00abc...'          # or a 0600 file referenced with --credential-file
-```
+- under **Client Credentials**, set **Client authentication** to **Public key / Private key**, then **Add key → Generate new key**. Okta shows the private key once: save the **JWK** form (it carries the key's ID) to a `0600` file outside any repository, or set it as an environment variable - never a flag. Okta keeps only the public half. You can instead paste the public half of a key pair you generated yourself (RSA 2048+ or EC P-256/P-384/P-521); a PEM private key works too, with its key ID given as `options: {key_id: <KID>}` on the target in `targets.yaml`;
+- if **Require Demonstrating Proof of Possession (DPoP) header in token requests** is checked, clear it: SaaSHound does not send DPoP proofs;
+- note the **Client ID**. It is the target's principal.
 
-**2. Place the ownership marker.** A tenant admin creates one Okta **group** named `saashound-authorized` whose **description** is the per-target marker value. `init` (next step) prints the exact value and where to put it; the tool only ever reads this group, so a token alone can never authorise an org. In the Admin Console: **Directory → Groups → Add group**.
+**2. Grant scopes and an admin role.** On the app's **Okta API Scopes** tab (a Super Admin must do this), grant what the techniques you run need:
 
-**3. Declare the target** (allowlist it in `targets.yaml`, which holds the tenant URL and a credential *reference*, never the token):
+| Scope | Needed for |
+|---|---|
+| `okta.orgs.read`, `okta.users.read`, `okta.groups.read`, `okta.logs.read` | every run: the org's identity, the lab-size check, the ownership marker, the System Log |
+| `okta.users.manage` | synthetic users and their MFA factors |
+| `okta.roles.manage` | the admin-role and custom-role techniques |
+| `okta.apps.manage`, `okta.appGrants.manage` | the service-app technique |
+| `okta.idps.manage` | the identity-provider technique |
+| `okta.policies.manage` | the policy technique |
+| `okta.networkZones.manage` | the network-zone technique |
+| `okta.policies.read`, `okta.apps.read`, `okta.idps.read`, `okta.networkZones.read`, `okta.roles.read` | `sweep`: listing every kind of object a run can create (`sweep --delete` uses the `.manage` scopes instead) |
+
+Each run's token asks for exactly its plan's scopes (`saashound plan` lists them) plus the org, users and groups read scopes in the first row (the System Log one is already among the plan's). So a technique whose scope you withhold is refused, naming the scope, before anything touches the org (an `apply` that names it alongside others is refused as a whole, like any guardrail refusal), and the techniques whose scopes you did grant run as usual. `sweep` needs to see every kind of object a run can create. A listing `sweep` asks only for the five `.read` scopes in the last row plus the org, users and groups ones in the first, so the `.manage` scopes alone do not cover it; `sweep --delete` asks for the `.manage` scopes of the ops that create those objects instead. Either way, a kind of object the token may not list is refused, naming the scope to grant, rather than reported clean. `sweep --delete` also refuses, before asking for confirmation, when it finds objects of a kind the token may list but not delete, naming the `.manage` scope to grant. **Do not grant `okta.groups.manage`**: the tool never asks for it, and without it no token the tool holds can create the ownership marker below.
+
+Then, on the app's **Admin roles** tab, assign it an admin role: Okta lets a service app do only what both its scopes and its roles allow. A custom admin role covering the techniques you run is the least-privilege choice. Assigning Super Admin to a user, or granting API scopes to an app, needs the service app itself to hold **Super Admin**; `saashound plan` says so next to those steps.
+
+**3. Place the ownership marker.** A tenant admin creates one Okta **group** named `saashound-authorized` whose **description** is the per-target marker value. `init` (next step) prints the exact value and where to put it; the tool only ever reads this group, with `okta.groups.read`, so a token alone can never authorise an org. In the Admin Console: **Directory → Groups → Add group**.
+
+**4. Declare the target** (allowlist it in `targets.yaml`, which holds the org URL, the app's client ID and a *reference* to the key, never the key):
 
 ```console
 $ ./saashound init okta --platform okta \
     --tenant https://your-org.okta.com \
-    --principal you@your-org.example \
+    --principal 0oa1b2c3d4e5f6g7h8i9 \
     --test-domain your-test-domain.example \
-    --credential-env OKTA_TOKEN
+    --credential-file ~/.config/saashound/okta-key.json      # or --credential-env OKTA_KEY
 wrote ~/.config/saashound/targets.yaml  (target okta, platform okta, environment lab)
 
 Authorize saashound for this tenant (a tenant admin must do this once):
   In the Okta Admin Console, go to Directory > Groups > Add group.
   Name the group exactly  saashound-authorized
-  and set its Description to  saashound-authorized:cc8326f4920d
+  and set its Description to  saashound-authorized:3f1d9c0a7e52
   ...
 Then: saashound auth okta
 ```
 
-`--tenant` is the bare org URL (no trailing slash); `--principal` is the login of the user the token belongs to (what `/api/v1/users/me` returns). Then verify and run:
+`--tenant` is the bare org URL (no trailing slash); `--principal` is the service app's client ID. Then check everything, read-only, before the first run:
 
 ```console
-$ ./saashound auth okta                 # read-only: confirms the org, principal, marker and System Log
+$ ./saashound auth okta
+okta   okta   your-org.okta.com   "Your Org"
+  principal   0oa1b2c3d4e5f6g7h8i9
+  credential  OAuth 2.0 service app, private_key_jwt (RS256, key Bq3xN7v2kQ); a per-session access token valid 1h
+  roles       SUPER_ADMIN
+  scopes      11 granted, 8 needed by the okta corpus; MISSING okta.appGrants.manage okta.idps.manage
+  allowlist   allowlisted
+  identity    tenant matches
+  marker      marker ok
+  environment lab
+  tier        okta: 3 of 25 active users allowed for a lab
+  telemetry   audit API reachable
+ready
 $ ./saashound apply okta.persistence.mfa-factor-register --target okta
 ```
 
+`auth` mints a token, asks the org who it was issued to (token introspection, so the principal is confirmed by the org itself, not taken from the config), reads the marker and the System Log, and lists any scope the corpus needs that the app was not granted. A missing scope only rules out the techniques that need it, so `auth` still says `ready`; a missing read scope from the first row of the table, a key the app does not hold, or a client ID that is not the app's is a refusal with what to fix.
+
 Everything else - the plan, the guardrail, the verified cleanup, the System Log verdict, the JSON lines and exit codes - is the same as for the simulated platform. See the eight shipped techniques with `saashound list` and `saashound show <id>`.
 
-> CI never touches a real org. The provider is proven against an in-process mock Okta ([providers/okta/mockokta](providers/okta/mockokta)) that speaks the same API and System Log; the real-org path is exercised by the operator.
+> CI never touches a real org. The provider is proven against an in-process mock Okta ([providers/okta/mockokta](providers/okta/mockokta)) that speaks the same API, OAuth token and introspection endpoints, and System Log: it checks every client assertion's signature and claims, and refuses any call whose token lacks the scope Okta's API reference says the endpoint needs, so a technique that under-declares its scopes fails CI. The real-org path is exercised by the operator.
 
 ## GitHub quick-start
 
-The GitHub provider runs the same loop against a GitHub **organization** you own. One honest tier line first: the org **audit-log REST API is GitHub Enterprise Cloud (GHEC) only**. On a GHEC org the whole loop works end to end, including the telemetry verdict; on a Free org techniques still **detonate and clean up**, but `saashound auth` reports telemetry `unsupported` and the verdict is `telemetry-unsupported` rather than `pass`. Three one-time steps, as for Okta.
+The GitHub provider runs the same loop against a GitHub **organization** you own. One honest tier line first: the org **audit-log REST API is GitHub Enterprise Cloud (GHEC) only**. On a GHEC org the whole loop works end to end, including the telemetry verdict; on a Free org techniques still **detonate and clean up**, but `saashound auth` reports telemetry `unsupported` and the verdict is `telemetry-unsupported` rather than `pass`. Three one-time steps.
 
 **1. Create an API token.** The tool never mints one. Use a **fine-grained personal access token** (preferred), a GHEC token, or a GitHub App installation token, scoped to this one org and to only what the techniques you run need - equivalent to the classic scopes `repo`, `delete_repo` (so cleanup can delete the run's repositories), `admin:org` (owner promotion), and `read:audit_log` (the audit log on GHEC). Put it in an environment variable or a `0600` file - never a flag:
 
@@ -286,7 +317,7 @@ In short:
 - **Ops are Go, reversible by construction.** An op ([internal/provider/op.go](internal/provider/op.go)) implements `Do`, `Undo` (its inverse) and `Gone` (proof the inverse worked), plus `Locate` (find a created object by its exact deterministic name after a crash) or `Prior` (read the value a modifying op is about to change, so it is journalled before the change). Registration fails loudly if any of these is missing.
 - **Write-ahead journal, verified cleanup.** The executor ([internal/engine](internal/engine)) writes and fsyncs an intent before every call and the result after it. Cleanup is a pure function of the journal: undo in reverse, treat "not found" as success, require `Gone`. An intent without a result (the process died mid-call) is resolved by exact-name lookup, never by substring search. Cleanup runs before telemetry collection, so nothing stays open during log latency.
 - **Correlation is exact.** Every request carries the run's User-Agent with its phase; the collector ([internal/telemetry](internal/telemetry)) keeps only events whose recorded User-Agent carries this run's ID, matches expectations against detonation-phase events only, and stops as soon as every expectation is met or its deadline passes. When every expectation is met but a referenced detection rule has not fired yet, it drains before stopping: up to 5 more polls, one poll interval apart, so a rule keyed on an event that lands a little after the expected ones is still judged on it. Its own audit-log reads carry the `collect` phase. A run whose collection ended (an API failure, a Ctrl-C) before every expectation was resolved is never a pass.
-- **The provider boundary is open.** A platform is one package implementing `provider.Provider` ([internal/provider/provider.go](internal/provider/provider.go)): its op vocabulary, an `AuditSource`, and a `Tenant` with `Whoami`, `ReadMarker`, `Capabilities` and `Sweep`. It registers itself from `init()` and is linked by one import line in [providers/all.go](providers/all.go). Nothing in the core switches on platform names: adding Okta, then GitHub, changed no core package. [providers/fake](providers/fake) is the reference implementation; [providers/okta](providers/okta) and [providers/github](providers/github) are the real ones (each a hand-written `net/http` client - no vendor SDK - with bearer/SSWS token auth, rate-limit back-off, Link-header pagination and strict secret redaction). All three pass the same conformance suite in [internal/conformance](internal/conformance).
+- **The provider boundary is open.** A platform is one package implementing `provider.Provider` ([internal/provider/provider.go](internal/provider/provider.go)): its op vocabulary, an `AuditSource`, and a `Tenant` with `Whoami`, `ReadMarker`, `Capabilities` and `Sweep`. It registers itself from `init()` and is linked by one import line in [providers/all.go](providers/all.go). Nothing in the core switches on platform names: Okta and GitHub were each added without one. The core tells a provider which scopes a session needs (`provider.Config.Scopes`: the plan's for `plan` and `apply`, the journalled ops' for `cleanup`, read-only ones for a listing `sweep`), so a provider whose credential can be narrowed per run never holds more. [providers/fake](providers/fake) is the reference implementation; [providers/okta](providers/okta) and [providers/github](providers/github) are the real ones (each a hand-written `net/http` client - no vendor SDK - GitHub with a bearer token, Okta with OAuth 2.0 `private_key_jwt` service-app auth minting a down-scoped token per run, both with rate-limit back-off, Link-header pagination and strict secret redaction). All three pass the same conformance suite in [internal/conformance](internal/conformance), which for Okta runs each op on a token carrying only the scopes it declares.
 - **Detection checkers are a seam.** [internal/detect](internal/detect) defines a narrow checker interface; the engine folds each checker's results into the verdict. The **Sigma** checker ([internal/detect/sigma](internal/detect/sigma)) implements it with [`runreveal/sigmalite`](https://github.com/runreveal/sigmalite): it loads the operator's own Sigma rules from a local directory (`--sigma-rules`, never vendored), maps the platform's raw events to the fields the rules key on, and evaluates each referenced rule against the run's detonation-phase events. A rule that is not found is `unknown` and one it cannot evaluate (a Sigma v2 correlation rule, or a rule the evaluator cannot parse) is `unsupported`, never a wrong pass. The `exec` (operator-SIEM) checker is the next increment behind the same seam.
 
 | Package | Role |
@@ -316,7 +347,8 @@ In short:
 ## Security of the tool itself
 
 - **No telemetry, no phone-home, no listener.** The tool talks to nothing but the declared tenant's API and exits. The simulated platform makes no network calls at all.
-- **Secrets.** Credentials come from an environment variable or a `0600` key file referenced in `targets.yaml`, never from a flag or the file itself. They are held in a type whose every formatting path prints `[redacted]`, and only a provider's transport may read the raw value. They never reach the journal, events, plan, result or logs; a canary test seeds a fake credential, drives every command at `-vv` and fails the build if it appears in any output or file.
+- **Secrets.** Credentials come from an environment variable or a `0600` key file referenced in `targets.yaml`, never from a flag or the file itself. They are held in a type whose every formatting path prints `[redacted]`, and only a provider's transport may read the raw value. They never reach the journal, events, plan, result or logs; a canary test seeds a fake credential, drives every command at `-vv` and fails the build if it appears in any output or file (for Okta: any line of the private key, and every client assertion and access token the mock org saw).
+- **No standing token.** The Okta provider holds the service app's private key, not an API token. Each run mints its own access token with only the scopes its plan needs, keeps it in memory, refreshes it shortly before its one-hour expiry, and sends it to the org's own host and nowhere else (a redirect is never followed). A leaked run token is inert within the hour and can do only what that run could.
 - **Local state** lives under the state directory in per-run directories (mode `0700`, files `0600`): `plan.json`, `journal.jsonl`, `events.jsonl`, `result.json`. One run per target at a time, enforced with a lock the kernel releases if the process dies.
 - **Architecture tests** ([internal/policy](internal/policy)) fail the build on `os/exec`, `text/template`, `plugin`, `reflect` or `unsafe` anywhere, on network imports outside real provider packages, on any listener, and on reading a raw secret outside a provider transport.
 - **Minimal dependencies:** the standard library, `go.yaml.in/yaml/v3` (the YAML project's maintained successor to `gopkg.in/yaml.v3`), `github.com/spf13/cobra` and `github.com/runreveal/sigmalite` (the Sigma evaluator, which itself pulls in `gopkg.in/yaml.v3`).
@@ -334,7 +366,7 @@ go test ./internal/cli -run Golden -update   # after an intended change to the r
 
 What the suites prove:
 
-- **Op conformance** ([providers/fake/fake_test.go](providers/fake/fake_test.go), [providers/okta/okta_test.go](providers/okta/okta_test.go) and [providers/github/github_test.go](providers/github/github_test.go), all via [internal/conformance](internal/conformance)): every registered op goes Do, Gone false, Locate (exact name only), Sweep, declared events with the run's User-Agent, Undo, Gone true, Undo again (idempotent), tenant unchanged. The okta ops run against the mock Okta org and the github ops against the mock GitHub org. The suite itself is tested against deliberately broken providers.
+- **Op conformance** ([providers/fake/fake_test.go](providers/fake/fake_test.go), [providers/okta/okta_test.go](providers/okta/okta_test.go) and [providers/github/github_test.go](providers/github/github_test.go), all via [internal/conformance](internal/conformance)): every registered op goes Do, Gone false, Locate (exact name only), Sweep, declared events with the run's User-Agent, Undo, Gone true, Undo again (idempotent), tenant unchanged. The okta ops run against the mock Okta org, each on an access token carrying only the scopes it declares, so a declared scope list that is not enough fails; the github ops run against the mock GitHub org. The suite itself is tested against deliberately broken providers.
 - **Technique conformance** ([internal/engine/engine_test.go](internal/engine/engine_test.go) for fake; [internal/cli/okta_test.go](internal/cli/okta_test.go) for okta; [internal/cli/github_test.go](internal/cli/github_test.go) for github): every embedded technique validates, plans, applies, cleans up verified, observes its audit-log telemetry and leaves the tenant byte-identical.
 - **Crash injection**: the run is killed at every point of every step of every technique (after the intent, after the call but before the result, after the result, after undo but before its record, between undo and gone, after gone), and a fresh cleaner, reading only the journal, must recover with nothing orphaned; a second cleanup must change nothing. [internal/cli/crash_unix_test.go](internal/cli/crash_unix_test.go), [internal/cli/okta_crash_unix_test.go](internal/cli/okta_crash_unix_test.go) and [internal/cli/github_crash_unix_test.go](internal/cli/github_crash_unix_test.go) do the same with real `SIGKILL`ed processes - the okta and github ones against a mock org in the parent process, which the killed child reaches over TCP.
 - **Golden output** ([internal/cli/testdata/golden](internal/cli/testdata/golden)): the exact JSON-lines records for passing and failing runs; every key must be documented in [docs/result-schema.md](docs/result-schema.md).
