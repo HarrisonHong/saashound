@@ -13,10 +13,13 @@ import (
 )
 
 // Record schema identifiers. Version changes only on a breaking change to
-// the record; adding a field is not breaking.
+// the record; adding a field is not breaking. Version 2: an expectation can
+// be met by an event correlated without its User-Agent, so `observed` no
+// longer implies the platform recorded the run's marker;
+// telemetry.expectations[].correlation says how each event was attributed.
 const (
 	Schema  = "saashound.result"
-	Version = 1
+	Version = 2
 )
 
 // Verdicts.

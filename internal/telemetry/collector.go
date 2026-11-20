@@ -2,10 +2,21 @@
 // exactly that run's events, and matches them against the technique's
 // expectations.
 //
-// Correlation is an exact identity: an event belongs to the run only if the
-// User-Agent the platform recorded parses as this tool's marker with this
-// run's ID. Expectations are matched against detonation-phase events only, so
-// cleanup traffic never satisfies an expectation.
+// Correlation rests on the User-Agent marker: an event whose recorded
+// User-Agent parses as this tool's marker with this run's ID is the run's,
+// with the phase the marker names. So that a platform that does not record
+// the User-Agent, or truncates it, does not make every expectation look
+// missing, an event without a usable User-Agent is also the run's when it
+// carries another run-specific signal (one of the run's object names, or the
+// run's own credential) and the platform stamped it inside the run window
+// from the journal. Every event the platform stamped is bounded by that
+// window, and nothing else is ever attributed to the run: see correlator.
+// Expectations are matched against detonation-phase events only, so cleanup
+// traffic never satisfies an expectation.
+//
+// Collection stops once every expectation is resolved, unless a detection
+// checker is still waiting on an event no expectation asked for: then the
+// collector drains, a bounded number of further polls (see Collector.Await).
 package telemetry
 
 import (
@@ -80,13 +91,17 @@ type Outcome struct {
 	// event being readable from the audit API.
 	LatencyS *float64 `json:"latency_s"`
 	EventID  string   `json:"event_id,omitempty"`
+	// Correlation is how the matching event was attributed to the run.
+	Correlation Signal `json:"correlation,omitempty"`
 }
 
 // Seen is a run event with the time the collector first saw it.
 type Seen struct {
 	provider.Event
-	Phase     marker.Phase
-	FirstSeen time.Time
+	Phase marker.Phase
+	// Correlation is how the event was attributed to the run.
+	Correlation Signal
+	FirstSeen   time.Time
 }
 
 // Result is the collector's output.
@@ -113,9 +128,12 @@ type Collector struct {
 	Source provider.AuditSource
 	Info   provider.AuditInfo
 	Clock  clock.Clock
-	// Skew widens the query window to tolerate clock differences between
-	// this machine and the platform.
+	// Skew widens the query window, and the run window, to tolerate clock
+	// differences between this machine and the platform.
 	Skew time.Duration
+	// Window is the run's span from its journal. It bounds every
+	// correlation, and without it only the User-Agent can correlate.
+	Window Window
 	// Trace receives per-event matching detail (-vv).
 	Trace func(format string, a ...any)
 	// Await, if set, extends collection for the detection checkers. A rule
@@ -141,7 +159,8 @@ func (c *Collector) trace(format string, a ...any) {
 
 // Collect polls from since until every expectation is met or its deadline
 // passes, then drains for the detection checkers (see Await), and returns
-// the run's events and an outcome per expectation.
+// the run's events and an outcome per expectation. Which events are the
+// run's is decided by the correlator (see correlator).
 //
 // An event first seen after its deadline is late when an earlier successful
 // poll, at or before the deadline, did not return it. When no poll happened
@@ -167,7 +186,12 @@ func (c *Collector) Collect(ctx context.Context, run string, since time.Time, ex
 	}
 	// The drain follows only a collection that checked every expectation.
 	checkedAll := len(exps) > 0 && len(pending) == len(exps)
-	seen := map[string]bool{}
+	k := correlator{run: run, window: c.Window, skew: c.Skew}
+	if cr, ok := c.Source.(provider.CredentialRecorder); ok {
+		k.credential = cr.RecordedCredential()
+	}
+	seen := map[string]bool{}     // the run's events, by ID
+	rejected := map[string]bool{} // events judged not the run's, by ID
 	var firstPoll time.Time
 
 	// poll reads the audit log once, keeps the run's events it has not seen
@@ -181,20 +205,32 @@ func (c *Collector) Collect(ctx context.Context, run string, since time.Time, ex
 			firstPoll = now
 		}
 		kept := 0
+		// Earliest first: without a User-Agent, a step's own event and the
+		// one its undo causes can both match an expectation, and on the
+		// platform's clock the step's comes first.
+		sort.SliceStable(evs, func(i, j int) bool { return evs[i].Time.Before(evs[j].Time) })
 		for _, ev := range evs {
-			if seen[ev.ID] {
+			if seen[ev.ID] || rejected[ev.ID] {
 				continue
 			}
-			ua, ok := marker.ParseUserAgent(ev.UserAgent)
-			if !ok || ua.Run != run {
-				continue // not this run's: another run, a person, the platform
+			m, ok, why := k.judge(ev)
+			if !ok {
+				// Not this run's: another run, a person, the platform. The
+				// verdict depends on the event alone, so it is reached once.
+				if ev.ID != "" {
+					rejected[ev.ID] = true
+				}
+				if why != "" {
+					c.trace("event %s %s not correlated: %s", ev.ID, ev.Type, why)
+				}
+				continue
 			}
 			seen[ev.ID] = true
 			kept++
-			s := Seen{Event: ev, Phase: ua.Phase, FirstSeen: now}
+			s := Seen{Event: ev, Phase: m.phase, Correlation: m.signal, FirstSeen: now}
 			res.Events = append(res.Events, s)
-			c.trace("event %s %s phase=%s", ev.ID, ev.Type, ua.Phase)
-			if ua.Phase != marker.PhaseDetonate || len(pending) == 0 {
+			c.trace("event %s %s %s", ev.ID, ev.Type, m)
+			if m.phase != marker.PhaseDetonate || len(pending) == 0 {
 				continue
 			}
 			doc, err := Decode(ev.Raw)
@@ -213,6 +249,7 @@ func (c *Collector) Collect(ctx context.Context, run string, since time.Time, ex
 				lat = roundTo(lat, 3)
 				outcomes[i].LatencyS = &lat
 				outcomes[i].EventID = ev.ID
+				outcomes[i].Correlation = m.signal
 				outcomes[i].Status = StatusObserved
 				if deadline := exps[i].ActionAt.Add(exps[i].Deadline); now.After(deadline) {
 					polledInTime := !firstPoll.IsZero() && !firstPoll.After(deadline)

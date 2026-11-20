@@ -35,8 +35,11 @@ type oktaLab struct {
 	srv   *mockokta.Server
 	clk   *clock.Fake
 	runID string
+	hook  func(engine.Point, string)
 }
 
+// newOktaLab starts a mock org, with any extra options, and declares it as
+// target "okta".
 func newOktaLab(t *testing.T, place bool, opts ...mockokta.Option) *oktaLab {
 	t.Helper()
 	dir := t.TempDir()
@@ -76,6 +79,7 @@ func (l *oktaLab) run(args ...string) result {
 		Registry: provider.Default,
 		Clock:    l.clk,
 		Retry:    &zero,
+		Hook:     l.hook,
 		Version:  "0.0.0-test",
 	}
 	if l.runID != "" {

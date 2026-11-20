@@ -137,18 +137,47 @@ func (t *Tenant) Close() error {
 type auditSource struct{ t *Tenant }
 
 // wireEvent is the subset of an org audit-log event the collector needs.
-// Decoding is defensive: a missing or oddly typed field yields a zero value.
+// Decoding is defensive (see provider.DecodeEvent): a missing or oddly typed
+// field yields a zero value.
 type wireEvent struct {
 	DocumentID string `json:"_document_id"`
 	Timestamp  int64  `json:"@timestamp"` // milliseconds since the epoch
 	Action     string `json:"action"`
 	UserAgent  string `json:"user_agent"`
+	// Repo and Repository name the repository an event acted on, as
+	// "<owner>/<name>"; which one GitHub sets depends on the action.
+	Repo       string `json:"repo"`
+	Repository string `json:"repository"`
+	// HashedToken identifies the token that made the request: the
+	// base64-encoded SHA-256 of the token.
+	HashedToken string `json:"hashed_token"`
 }
 
+// objects returns the repository names the event records, for the
+// collector's name-prefix correlation.
+func (w wireEvent) objects() []string {
+	var out []string
+	for _, v := range []string{w.Repo, w.Repository} {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// RecordedCredential implements provider.CredentialRecorder: GitHub records
+// the hashed_token of the token behind each request, so the collector can
+// recognise this run's requests even when GitHub did not record their
+// User-Agent.
+func (a auditSource) RecordedCredential() string { return a.t.client.auth.hashedToken() }
+
+var _ provider.CredentialRecorder = auditSource{}
+
 // Poll reads the org audit log for the query window. It returns every event in
-// the window verbatim; the collector keeps the ones whose recorded User-Agent
-// carries this run's marker. GitHub's audit-log phrase filter is date-grained,
-// so the window is widened to whole days and the collector refines it.
+// the window verbatim, with its recorded User-Agent, repository and
+// hashed_token; the collector keeps the ones that are this run's. GitHub's
+// audit-log phrase filter is date-grained, so the window is widened to whole
+// days and the collector refines it.
 func (a auditSource) Poll(ctx context.Context, q provider.AuditQuery) ([]provider.Event, error) {
 	path := "/orgs/" + escape(a.t.org) + "/audit-log?per_page=100&order=asc"
 	if !q.Since.IsZero() {
@@ -161,15 +190,21 @@ func (a auditSource) Poll(ctx context.Context, q provider.AuditQuery) ([]provide
 	out := make([]provider.Event, 0, len(raws))
 	for _, raw := range raws {
 		var w wireEvent
-		if json.Unmarshal(raw, &w) != nil {
+		if !provider.DecodeEvent(raw, &w) {
 			continue
 		}
+		var at time.Time // zero when GitHub recorded no timestamp
+		if w.Timestamp != 0 {
+			at = time.UnixMilli(w.Timestamp).UTC()
+		}
 		out = append(out, provider.Event{
-			ID:        w.DocumentID,
-			Time:      time.UnixMilli(w.Timestamp).UTC(),
-			Type:      w.Action,
-			UserAgent: w.UserAgent,
-			Raw:       append(json.RawMessage(nil), raw...),
+			ID:         w.DocumentID,
+			Time:       at,
+			Type:       w.Action,
+			UserAgent:  w.UserAgent,
+			Objects:    w.objects(),
+			Credential: w.HashedToken,
+			Raw:        append(json.RawMessage(nil), raw...),
 		})
 	}
 	return out, nil

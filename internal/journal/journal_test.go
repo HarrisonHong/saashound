@@ -282,3 +282,48 @@ func TestWriterRefusesAfterFailedRollback(t *testing.T) {
 		t.Fatalf("after repair: %v %+v", err, j)
 	}
 }
+
+// TestSpan: the run's span runs from its first intent to its last record, and
+// detonation ends at its last detonation record, before any cleanup record.
+func TestSpan(t *testing.T) {
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(t0)
+	p := filepath.Join(t.TempDir(), "journal.jsonl")
+	w, err := Create(p, header(), clk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := j.Span(); ok {
+		t.Fatal("a journal with no intent has no span: nothing can have changed")
+	}
+	step := func(d time.Duration, r Record) {
+		clk.Advance(d)
+		must(t, w.Append(r))
+	}
+	step(time.Second, Record{Kind: KindIntent, Step: "a"})
+	step(time.Second, Record{Kind: KindResult, Step: "a", ID: "00u1"})
+	step(time.Second, Record{Kind: KindIntent, Step: "b"})
+	step(time.Second, Record{Kind: KindError, Step: "b", Error: "boom"})
+	step(time.Second, Record{Kind: KindPhase, Phase: PhaseDetonateFailed})
+	step(time.Second, Record{Kind: KindUndo, Step: "b", Outcome: OutcomeRemoved})
+	step(time.Second, Record{Kind: KindGone, Step: "b", Verified: Bool(true)})
+	step(time.Second, Record{Kind: KindPhase, Phase: PhaseCleanupVerified})
+	must(t, w.Close())
+
+	j, err = Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, ok := j.Span()
+	if !ok {
+		t.Fatal("no span")
+	}
+	want := Span{Start: t0.Add(time.Second), DetonateEnd: t0.Add(5 * time.Second), End: t0.Add(8 * time.Second)}
+	if !sp.Start.Equal(want.Start) || !sp.DetonateEnd.Equal(want.DetonateEnd) || !sp.End.Equal(want.End) {
+		t.Fatalf("Span() = %+v, want %+v", sp, want)
+	}
+}

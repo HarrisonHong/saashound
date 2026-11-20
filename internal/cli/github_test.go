@@ -31,18 +31,23 @@ const (
 // githubLab is a mock GitHub org wired into the CLI through a targets.yaml that
 // points at it, exactly as a real org would be.
 type githubLab struct {
-	t   *testing.T
-	dir string
-	srv *mockgithub.Server
-	clk *clock.Fake
+	t     *testing.T
+	dir   string
+	srv   *mockgithub.Server
+	clk   *clock.Fake
+	runID string
+	hook  func(engine.Point, string)
 }
 
-func newGithubLab(t *testing.T, place bool) *githubLab {
+// newGithubLab starts a mock org, with any extra options, and declares it as
+// target "github".
+func newGithubLab(t *testing.T, place bool, opts ...mockgithub.Option) *githubLab {
 	t.Helper()
 	dir := t.TempDir()
 	clk := clock.NewFake(time.Date(2026, 11, 14, 15, 2, 11, 0, time.UTC))
-	srv := mockgithub.New(mockgithub.WithToken(ghToken), mockgithub.WithPrincipal(ghPrincipal),
-		mockgithub.WithOrg(ghOrg), mockgithub.WithMember(ghSecond), mockgithub.WithClock(clk.Now))
+	opts = append([]mockgithub.Option{mockgithub.WithToken(ghToken), mockgithub.WithPrincipal(ghPrincipal),
+		mockgithub.WithOrg(ghOrg), mockgithub.WithMember(ghSecond), mockgithub.WithClock(clk.Now)}, opts...)
+	srv := mockgithub.New(opts...)
 	t.Cleanup(srv.Close)
 	lab := &githubLab{t: t, dir: dir, srv: srv, clk: clk}
 	lab.writeTargets()
@@ -96,7 +101,12 @@ func (l *githubLab) run(args ...string) result {
 		Registry: provider.Default,
 		Clock:    l.clk,
 		Retry:    &zero,
+		Hook:     l.hook,
 		Version:  "0.0.0-test",
+	}
+	if l.runID != "" {
+		id := l.runID
+		env.NewRunID = func() (string, error) { return id, nil }
 	}
 	full := append([]string{"--targets", filepath.Join(l.dir, "targets.yaml"), "--state-dir", filepath.Join(l.dir, "state")}, args...)
 	code := cli.Main(context.Background(), full, env)

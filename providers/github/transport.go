@@ -1,6 +1,8 @@
 package github
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"net/http"
 
 	"github.com/HarrisonHong/saashound/internal/secret"
@@ -39,3 +41,15 @@ func (t *authTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 // wipe scrubs the token from memory.
 func (t *authTransport) wipe() { t.token.Wipe() }
+
+// hashedToken is the token as GitHub's audit log records it in hashed_token:
+// the base64-encoded SHA-256 of the token. It identifies the credential
+// without revealing it, so the collector can recognise the run's own
+// requests. It is empty once the token is wiped.
+func (t *authTransport) hashedToken() string {
+	if t.token.Empty() {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(t.token.Reveal()))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}

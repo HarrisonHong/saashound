@@ -153,17 +153,35 @@ func (t *Tenant) Close() error { return nil }
 type auditSource struct{ t *Tenant }
 
 // wireEvent is the subset of an event the provider reads back. Fields are
-// decoded defensively: a missing or oddly typed field yields a zero value,
-// never a panic.
+// decoded defensively (see provider.DecodeEvent): a missing or oddly typed
+// field yields a zero value, never a panic.
 type wireEvent struct {
-	UUID      string    `json:"uuid"`
-	Published time.Time `json:"published"`
-	EventType string    `json:"eventType"`
+	UUID      string             `json:"uuid"`
+	Published provider.EventTime `json:"published"`
+	EventType string             `json:"eventType"`
 	Client    struct {
 		UserAgent struct {
 			RawUserAgent string `json:"rawUserAgent"`
 		} `json:"userAgent"`
 	} `json:"client"`
+	Target []struct {
+		AlternateID string `json:"alternateId"`
+		DisplayName string `json:"displayName"`
+	} `json:"target"`
+}
+
+// objects returns every target name the event records, for the collector's
+// name-prefix correlation.
+func (w wireEvent) objects() []string {
+	var out []string
+	for _, t := range w.Target {
+		for _, v := range []string{t.DisplayName, t.AlternateID} {
+			if v != "" {
+				out = append(out, v)
+			}
+		}
+	}
+	return out
 }
 
 // Poll implements provider.AuditSource.
@@ -180,7 +198,7 @@ func (a auditSource) Poll(ctx context.Context, q provider.AuditQuery) ([]provide
 				continue // not ingested yet
 			}
 			var w wireEvent
-			if err := json.Unmarshal(le.Event, &w); err != nil {
+			if !provider.DecodeEvent(le.Event, &w) {
 				continue
 			}
 			if w.Published.Before(q.Since) || (!q.Until.IsZero() && w.Published.After(q.Until)) {
@@ -188,9 +206,10 @@ func (a auditSource) Poll(ctx context.Context, q provider.AuditQuery) ([]provide
 			}
 			out = append(out, provider.Event{
 				ID:        w.UUID,
-				Time:      w.Published,
+				Time:      w.Published.Time,
 				Type:      w.EventType,
 				UserAgent: w.Client.UserAgent.RawUserAgent,
+				Objects:   w.objects(),
 				Raw:       append(json.RawMessage(nil), le.Event...),
 			})
 		}
@@ -292,7 +311,7 @@ func (e *emitter) flush() {
 		if d, ok := e.t.audit.lagByType[p.typ]; ok {
 			lag = d
 		}
-		appendEvent(e.s, e.now, e.now.Add(lag), a, e.ua, p.typ, p.msg, p.targets...)
+		appendEvent(e.s, e.now, e.now.Add(lag), a, e.t.audit.userAgent(e.ua), p.typ, p.msg, p.targets...)
 	}
 }
 

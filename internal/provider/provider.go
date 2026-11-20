@@ -183,25 +183,84 @@ type AuditQuery struct {
 	Since time.Time
 	Until time.Time
 	// Run lets a provider filter server-side where the platform allows it.
-	// The collector filters exactly on the User-Agent regardless.
+	// The collector correlates every event to the run itself regardless.
 	Run string
 }
 
 // AuditSource reads the platform's own audit log.
+//
+// The collector attributes an event to a run by the User-Agent the platform
+// recorded and, when that did not survive, by the run's object names in
+// Event.Objects or the run's credential in Event.Credential. A provider
+// fills both from the platform's own fields wherever the platform records
+// them.
 type AuditSource interface {
 	Poll(ctx context.Context, q AuditQuery) ([]Event, error)
+}
+
+// CredentialRecorder is implemented by an AuditSource whose platform records,
+// on each event, an identifier of the credential that made the request (see
+// Event.Credential). RecordedCredential returns that identifier for the
+// credential this connection authenticates with, so the collector can tell
+// the run's own requests apart when their User-Agent did not survive. It
+// must never return the credential itself.
+type CredentialRecorder interface {
+	RecordedCredential() string
 }
 
 // Event is one raw audit event.
 type Event struct {
 	ID string
-	// Time is the platform's own event timestamp.
+	// Time is the platform's own event timestamp; zero if it recorded none.
 	Time time.Time
 	Type string
 	// UserAgent is the User-Agent the platform recorded for the request.
 	UserAgent string
+	// Objects are the values the platform recorded for the objects the event
+	// acted on, from the fields where it names them: for example an Okta
+	// target's displayName and alternateId, or a GitHub event's repo. They
+	// may decorate an object's name, as a login carries its domain or a
+	// repository its owner.
+	Objects []string
+	// Credential is the identifier the platform recorded for the credential
+	// that made the request, never the credential itself (GitHub's
+	// hashed_token); empty when the platform records none.
+	Credential string
 	// Raw is the event exactly as the platform returned it.
 	Raw json.RawMessage
+}
+
+// DecodeEvent decodes a raw audit event into v, which is the subset of the
+// event a provider reads. Audit events are untrusted input: a field of an
+// unexpected type is left zero rather than losing the whole event, so an
+// oddly typed field a correlation signal does not need can never hide an
+// event from the collector. A timestamp is decoded through EventTime, which
+// extends the same rule to a value that is not a timestamp. It reports false
+// only for a malformed event.
+func DecodeEvent(raw json.RawMessage, v any) bool {
+	err := json.Unmarshal(raw, v)
+	var typeErr *json.UnmarshalTypeError
+	return err == nil || errors.As(err, &typeErr)
+}
+
+// EventTime is a platform's RFC 3339 event timestamp inside an event decoded
+// with DecodeEvent. A value that is not an RFC 3339 string (empty, free
+// text, a number) leaves the zero time rather than failing the decode, so an
+// event with an unusable timestamp is kept as one the platform did not
+// stamp.
+type EventTime struct{ time.Time }
+
+// UnmarshalJSON implements json.Unmarshaler. It never fails.
+func (t *EventTime) UnmarshalJSON(b []byte) error {
+	t.Time = time.Time{}
+	var s string
+	if json.Unmarshal(b, &s) != nil {
+		return nil
+	}
+	if at, err := time.Parse(time.RFC3339, s); err == nil {
+		t.Time = at
+	}
+	return nil
 }
 
 // Orphan is a run-created object found by Sweep.

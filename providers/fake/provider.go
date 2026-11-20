@@ -105,7 +105,16 @@ const (
 	// object the client never learned the ID of, as a dropped HTTP response
 	// would.
 	OptAPILatency = "api_latency"
+	// OptAuditUserAgent says what the log records for a request's
+	// User-Agent: "recorded" (the default) as sent, "dropped" nothing, or
+	// "truncated" only its first TruncatedUserAgentLen bytes, so the run
+	// marker does not survive whole.
+	OptAuditUserAgent = "audit_user_agent"
 )
+
+// TruncatedUserAgentLen is how much of a User-Agent a log with
+// audit_user_agent: truncated keeps.
+const TruncatedUserAgentLen = 24
 
 type auditSim struct {
 	latency   time.Duration
@@ -113,10 +122,12 @@ type auditSim struct {
 	lagByType map[string]time.Duration
 	drop      map[string]bool
 	supported bool
+	// userAgent is what the log records for a request's User-Agent.
+	userAgent func(string) string
 }
 
 func parseOptions(opts map[string]string) (auditSim, error) {
-	a := auditSim{lagByType: map[string]time.Duration{}, drop: map[string]bool{}, supported: true}
+	a := auditSim{lagByType: map[string]time.Duration{}, drop: map[string]bool{}, supported: true, userAgent: func(ua string) string { return ua }}
 	keys := make([]string, 0, len(opts))
 	for k := range opts {
 		keys = append(keys, k)
@@ -148,6 +159,16 @@ func parseOptions(opts map[string]string) (auditSim, error) {
 				if t = strings.TrimSpace(t); t != "" {
 					a.drop[t] = true
 				}
+			}
+		case k == OptAuditUserAgent:
+			switch v {
+			case "recorded":
+			case "dropped":
+				a.userAgent = func(string) string { return "" }
+			case "truncated":
+				a.userAgent = func(ua string) string { return ua[:min(len(ua), TruncatedUserAgentLen)] }
+			default:
+				return a, fmt.Errorf("fake: option %s must be recorded, dropped or truncated", k)
 			}
 		case k == OptAudit:
 			switch v {

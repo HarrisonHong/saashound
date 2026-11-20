@@ -81,7 +81,7 @@ Each `expect` entry is one audit event the platform must log after a step:
 - `match`: field paths to values; every entry must match. `target[].id` matches any element of the `target` array. The match must include the platform's event-type field (`eventType` on Okta and the simulated platform, `action` on GitHub), and that event must be one the `after` step's op is declared to produce. Placeholders may refer to the `after` step and anything earlier.
 - `deadline`: optional, between `1s` and `24h`. It defaults to the platform's documented lag (30 s on the simulated platform, 5 minutes on Okta and GitHub).
 
-The collector keeps only this run's events (by the User-Agent the platform recorded) and matches expectations against detonation-phase events only, so cleanup traffic never satisfies one. An event that does not arrive by its deadline makes the verdict `telemetry-missing`.
+The collector keeps only the events it can attribute to this run (see [Correlation](result-schema.md#correlation)) and matches expectations against detonation-phase events only, so cleanup traffic never satisfies one. An event that does not arrive by its deadline makes the verdict `telemetry-missing`.
 
 ## Detections
 

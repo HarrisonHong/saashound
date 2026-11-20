@@ -140,21 +140,45 @@ func (t *Tenant) Close() error {
 type auditSource struct{ t *Tenant }
 
 // wireEvent is the subset of a System Log event the collector needs. Decoding
-// is defensive: a missing or oddly typed field yields a zero value.
+// is defensive (see provider.DecodeEvent): a missing or oddly typed field
+// yields a zero value.
 type wireEvent struct {
-	UUID      string    `json:"uuid"`
-	Published time.Time `json:"published"`
-	EventType string    `json:"eventType"`
+	UUID      string             `json:"uuid"`
+	Published provider.EventTime `json:"published"`
+	EventType string             `json:"eventType"`
 	Client    struct {
 		UserAgent struct {
 			RawUserAgent string `json:"rawUserAgent"`
 		} `json:"userAgent"`
 	} `json:"client"`
+	Target []wireTarget `json:"target"`
+}
+
+// wireTarget is one System Log target. Okta names the object in displayName
+// (a zone, policy, rule, app label, IdP, role or resource set) and, for a
+// user, puts the login in alternateId.
+type wireTarget struct {
+	AlternateID string `json:"alternateId"`
+	DisplayName string `json:"displayName"`
+}
+
+// objects returns every target name the event records, for the collector's
+// name-prefix correlation.
+func (w wireEvent) objects() []string {
+	var out []string
+	for _, t := range w.Target {
+		for _, v := range []string{t.DisplayName, t.AlternateID} {
+			if v != "" {
+				out = append(out, v)
+			}
+		}
+	}
+	return out
 }
 
 // Poll reads the System Log for the query window. It returns every event in
-// the window verbatim; the collector keeps the ones whose recorded User-Agent
-// carries this run's marker.
+// the window verbatim, with its recorded User-Agent and target names; the
+// collector keeps the ones that are this run's.
 func (a auditSource) Poll(ctx context.Context, q provider.AuditQuery) ([]provider.Event, error) {
 	path := "/api/v1/logs?limit=100"
 	if !q.Since.IsZero() {
@@ -170,14 +194,15 @@ func (a auditSource) Poll(ctx context.Context, q provider.AuditQuery) ([]provide
 	out := make([]provider.Event, 0, len(raws))
 	for _, raw := range raws {
 		var w wireEvent
-		if json.Unmarshal(raw, &w) != nil {
+		if !provider.DecodeEvent(raw, &w) {
 			continue
 		}
 		out = append(out, provider.Event{
 			ID:        w.UUID,
-			Time:      w.Published,
+			Time:      w.Published.Time,
 			Type:      w.EventType,
 			UserAgent: w.Client.UserAgent.RawUserAgent,
+			Objects:   w.objects(),
 			Raw:       append(json.RawMessage(nil), raw...),
 		})
 	}

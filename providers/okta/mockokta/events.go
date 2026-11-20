@@ -24,7 +24,7 @@ type actor struct {
 
 // emit appends one System Log event for a call the service app made, with the
 // request's User-Agent, the way Okta records client.userAgent.rawUserAgent for
-// the request that caused it.
+// the request that caused it (or what WithRecordedUserAgent makes of it).
 func (s *Server) emit(st *State, ua, eventType, message string, targets ...target) {
 	s.emitAs(st, s.appActor(), ua, eventType, message, targets...)
 }
@@ -51,7 +51,7 @@ func (s *Server) emitAs(st *State, a actor, ua, eventType, message string, targe
 		"displayMessage": message,
 		"severity":       "INFO",
 		"actor":          a,
-		"client":         map[string]any{"userAgent": map[string]string{"rawUserAgent": ua}},
+		"client":         map[string]any{"userAgent": map[string]string{"rawUserAgent": s.recordUA(ua)}},
 		"outcome":        map[string]string{"result": "SUCCESS"},
 		"target":         targets,
 	}

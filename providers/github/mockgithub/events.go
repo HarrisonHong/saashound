@@ -7,10 +7,13 @@ import (
 	"time"
 )
 
-// emit appends one audit-log event with the request's User-Agent, the way
-// GitHub records user_agent for the request that caused it. A dropped action
-// is silently not logged (a platform coverage gap); a lagged one is published
-// now but not visible to the audit-log API until later.
+// emit appends one audit-log event with the request's User-Agent and the
+// hashed_token of the token that made it, the way GitHub records them for the
+// request that caused it (or what WithRecordedUserAgent and
+// WithoutHashedToken make of them). Every request the mock serves carries its
+// one token. A dropped action is silently not logged (a platform coverage
+// gap); a lagged one is published now but not visible to the audit-log API
+// until later.
 func (s *Server) emit(st *State, ua, action string, fields map[string]any) {
 	if s.drop[action] {
 		return
@@ -22,12 +25,15 @@ func (s *Server) emit(st *State, ua, action string, fields map[string]any) {
 	}
 	ev := map[string]any{
 		"_document_id": st.newDocID(),
-		"@timestamp":   now.UnixMilli(),
-		"created_at":   now.UnixMilli(),
+		"@timestamp":   now.Add(s.clockOffset).UnixMilli(),
+		"created_at":   now.Add(s.clockOffset).UnixMilli(),
 		"action":       action,
 		"actor":        s.principal,
 		"org":          st.Org.Login,
-		"user_agent":   ua,
+		"user_agent":   s.recordUA(ua),
+	}
+	if s.hashToken {
+		ev["hashed_token"] = HashedToken(s.token)
 	}
 	for k, v := range fields {
 		ev[k] = v

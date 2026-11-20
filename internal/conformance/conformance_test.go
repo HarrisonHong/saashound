@@ -24,6 +24,43 @@ type broken struct {
 	kind string
 }
 
+// Open wraps the tenant for defects that live in the audit source.
+func (b broken) Open(ctx context.Context, cfg provider.Config) (provider.Tenant, error) {
+	ten, err := b.Provider.Open(ctx, cfg)
+	if err != nil || b.kind != "no-object-names" {
+		return ten, err
+	}
+	return namelessTenant{ten}, nil
+}
+
+// namelessTenant's audit source reports no object names, so without the
+// User-Agent nothing ties its events to a run.
+type namelessTenant struct{ provider.Tenant }
+
+func (t namelessTenant) AuditSource() provider.AuditSource {
+	return namelessSource{t.Tenant.AuditSource()}
+}
+
+type namelessSource struct{ provider.AuditSource }
+
+func (s namelessSource) Poll(ctx context.Context, q provider.AuditQuery) ([]provider.Event, error) {
+	evs, err := s.AuditSource.Poll(ctx, q)
+	for i := range evs {
+		evs[i].Objects = nil
+	}
+	return evs, err
+}
+
+// unwrap hands the wrapped provider's ops the tenant type they expect.
+func unwrap(c *provider.Call) *provider.Call {
+	if nt, ok := c.Tenant.(namelessTenant); ok {
+		cc := *c
+		cc.Tenant = nt.Tenant
+		return &cc
+	}
+	return c
+}
+
 func (b broken) Ops() []provider.Op {
 	var out []provider.Op
 	for _, op := range b.Provider.Ops() {
@@ -40,6 +77,7 @@ type brokenOp struct {
 }
 
 func (o *brokenOp) Do(ctx context.Context, c *provider.Call) (provider.Result, error) {
+	c = unwrap(c)
 	if o.kind == "no-user-agent" {
 		ctx = context.Background() // forgets the run's User-Agent
 	}
@@ -47,6 +85,7 @@ func (o *brokenOp) Do(ctx context.Context, c *provider.Call) (provider.Result, e
 }
 
 func (o *brokenOp) Undo(ctx context.Context, c *provider.Call, r provider.Record) error {
+	c = unwrap(c)
 	o.mu.Lock()
 	again := o.undone[r.ID]
 	o.undone[r.ID] = true
@@ -58,6 +97,7 @@ func (o *brokenOp) Undo(ctx context.Context, c *provider.Call, r provider.Record
 }
 
 func (o *brokenOp) Gone(ctx context.Context, c *provider.Call, r provider.Record) (bool, error) {
+	c = unwrap(c)
 	if o.kind == "gone-always-true" {
 		return true, nil
 	}
@@ -65,6 +105,7 @@ func (o *brokenOp) Gone(ctx context.Context, c *provider.Call, r provider.Record
 }
 
 func (o *brokenOp) Locate(ctx context.Context, c *provider.Call) (provider.Result, bool, error) {
+	c = unwrap(c)
 	l := o.Op.(provider.Locator)
 	res, found, err := l.Locate(ctx, c)
 	if o.kind != "locate-by-prefix" || found || err != nil {
@@ -82,6 +123,7 @@ func (o *brokenOp) Locate(ctx context.Context, c *provider.Call) (provider.Resul
 }
 
 func (o *brokenOp) Prior(ctx context.Context, c *provider.Call) (json.RawMessage, error) {
+	c = unwrap(c)
 	return o.Op.(provider.PriorReader).Prior(ctx, c)
 }
 
@@ -133,6 +175,7 @@ func TestSuiteCatchesBrokenProviders(t *testing.T) {
 		"locate-by-prefix":    "Locate must match the exact name only",
 		"undo-not-idempotent": "Undo on an undone object must succeed or wrap ErrNotFound",
 		"no-user-agent":       "were not logged with User-Agent",
+		"no-object-names":     "without its User-Agent it could not be attributed to the run",
 	}
 	for kind, want := range cases {
 		t.Run(kind, func(t *testing.T) {

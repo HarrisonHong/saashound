@@ -154,12 +154,14 @@ func (e *Engine) observe(ctx context.Context, tenant provider.Tenant, p *plan.Ru
 		Info:   prov.Audit(),
 		Clock:  e.Clock,
 		Skew:   AuditSkew,
+		Window: e.runWindow(run),
 		Trace: func(format string, a ...any) {
 			e.emit(Event{Run: run, Level: 2, Stage: "telemetry", Msg: fmt.Sprintf(format, a...)})
 		},
 		Await: e.awaiting(p, since),
 	}
 	res := col.Collect(cctx, run, since, exps)
+	e.emitCorrelation(run, res.Events)
 	if err := e.writeEvents(run, res.Events); err != nil {
 		e.emit(Event{Run: run, Stage: "telemetry", Msg: "write events.jsonl: " + err.Error(), Alarm: true})
 	}
@@ -236,10 +238,69 @@ func unproven(rs []detect.Result, why telemetry.Unsettled, drainErr string) []de
 	return rs
 }
 
+// runWindow is the run's span from its journal, which bounds correlation,
+// with the last mutation of the run that went before it on the same target
+// to bound the credential signal. A zero window, when the journal cannot be
+// read back, leaves the User-Agent as the only signal.
+func (e *Engine) runWindow(run string) telemetry.Window {
+	jpath, err := e.State.File(run, state.JournalFile)
+	if err != nil {
+		return telemetry.Window{}
+	}
+	j, err := journal.Load(jpath)
+	if err != nil {
+		e.emit(Event{Run: run, Level: 1, Stage: "telemetry", Msg: "no run window (" + err.Error() + "): only the User-Agent can correlate events"})
+		return telemetry.Window{}
+	}
+	sp, ok := j.Span()
+	if !ok {
+		return telemetry.Window{}
+	}
+	return telemetry.Window{
+		Start: sp.Start, DetonateEnd: sp.DetonateEnd, End: sp.End,
+		PreviousMutation: e.State.PreviousLastMutation(run, j.Header.Target, sp.Start),
+	}
+}
+
+// signals lists every correlation signal, strongest first.
+var signals = []telemetry.Signal{telemetry.SignalUserAgent, telemetry.SignalNamePrefix, telemetry.SignalHashedToken}
+
+// bySignal renders counts per signal, strongest first, leaving out skip:
+// "4 by user-agent, 2 by name-prefix".
+func bySignal(n map[telemetry.Signal]int, skip telemetry.Signal) string {
+	var by []string
+	for _, s := range signals {
+		if s != skip && n[s] > 0 {
+			by = append(by, fmt.Sprintf("%d by %s", n[s], s))
+		}
+	}
+	return strings.Join(by, ", ")
+}
+
+// emitCorrelation reports at -v how the run's events were attributed to it,
+// so an operator can see when a match did not rest on the User-Agent.
+func (e *Engine) emitCorrelation(run string, evs []telemetry.Seen) {
+	n := map[telemetry.Signal]int{}
+	for _, ev := range evs {
+		n[ev.Correlation]++
+	}
+	msg := fmt.Sprintf("correlated %d events", len(evs))
+	if by := bySignal(n, ""); by != "" {
+		msg += ": " + by
+	}
+	if fallback := len(evs) - n[telemetry.SignalUserAgent]; fallback > 0 {
+		msg += fmt.Sprintf("; %d without a usable User-Agent, matched inside the run window", fallback)
+	}
+	e.emit(Event{Run: run, Level: 1, Stage: "telemetry", Msg: msg})
+}
+
 func (e *Engine) emitTelemetry(run string, t report.Telemetry, d time.Duration) {
 	msg := fmt.Sprintf("%d/%d expected events observed", t.Observed, t.Expected)
 	if t.MaxLatencyS != nil {
 		msg += fmt.Sprintf(", max latency %.1fs", *t.MaxLatencyS)
+	}
+	if fallback := withoutUserAgent(t.Expectations); fallback != "" {
+		msg += "; matched without the User-Agent: " + fallback
 	}
 	var problems []string
 	for _, o := range t.Expectations {
@@ -258,6 +319,16 @@ func (e *Engine) emitTelemetry(run string, t report.Telemetry, d time.Duration) 
 	}
 	e.emit(Event{Run: run, Stage: "telemetry", Msg: msg, Alarm: len(problems) > 0 || t.Unchecked()})
 	e.emit(Event{Run: run, Level: 1, Stage: "telemetry", Msg: "collection finished", Duration: d})
+}
+
+// withoutUserAgent summarises the expectations met by an event correlated
+// without the User-Agent, for example "2 by name-prefix", or "" if none.
+func withoutUserAgent(outs []telemetry.Outcome) string {
+	n := map[telemetry.Signal]int{}
+	for _, o := range outs {
+		n[o.Correlation]++
+	}
+	return bySignal(n, telemetry.SignalUserAgent)
 }
 
 // writeEvents stores the run's raw events verbatim, one per line.

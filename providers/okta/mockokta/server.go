@@ -19,6 +19,8 @@ type Server struct {
 	lag       time.Duration
 	lagByType map[string]time.Duration
 	drop      map[string]bool
+	// recordUA is what the System Log records for a request's User-Agent.
+	recordUA func(string) string
 
 	// app is the API Services app the tool authenticates as; customKeys
 	// records that WithClientKey replaced its default key.
@@ -64,6 +66,13 @@ func WithDrop(eventType string) Option {
 	return func(s *Server) { s.drop[eventType] = true }
 }
 
+// WithRecordedUserAgent makes the System Log record record(ua) as an event's
+// client.userAgent.rawUserAgent instead of the request's User-Agent, to model
+// an org that drops it (return "") or truncates it.
+func WithRecordedUserAgent(record func(ua string) string) Option {
+	return func(s *Server) { s.recordUA = record }
+}
+
 // New starts a mock org seeded with one human Super Admin and the API
 // Services app the tool authenticates as: client ID DefaultClientID, the
 // public half of DefaultKey registered, every Okta API scope granted and the
@@ -74,6 +83,7 @@ func New(opts ...Option) *Server {
 		now:       time.Now,
 		lagByType: map[string]time.Duration{},
 		drop:      map[string]bool{},
+		recordUA:  func(ua string) string { return ua },
 		app: serviceApp{
 			clientID: DefaultClientID,
 			label:    "SaaSHound",

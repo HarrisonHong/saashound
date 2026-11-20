@@ -1,6 +1,8 @@
 package mockgithub
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -18,10 +20,17 @@ type Server struct {
 	principal string
 	org       string
 	now       func() time.Time
-	lag       time.Duration
-	lagByType map[string]time.Duration
-	drop      map[string]bool
-	seed      []string // extra member logins to create at New
+	// clockOffset is how far the org's clock runs ahead of now.
+	clockOffset time.Duration
+	lag         time.Duration
+	lagByType   map[string]time.Duration
+	drop        map[string]bool
+	seed        []string // extra member logins to create at New
+	// recordUA is what the audit log records for a request's User-Agent.
+	recordUA func(string) string
+	// hashToken records hashed_token on every event, as GitHub does for
+	// requests made with a token.
+	hashToken bool
 
 	// fail403 makes the next n API calls answer a primary rate-limit 403, to
 	// exercise the client's back-off. Guarded by g.mu.
@@ -45,6 +54,11 @@ func WithOrg(slug string) Option { return func(s *Server) { s.org = slug } }
 // a fake clock see events inside their query window.
 func WithClock(now func() time.Time) Option { return func(s *Server) { s.now = now } }
 
+// WithClockOffset makes the org's clock run d ahead of the clock (behind it
+// when d is negative): events are stamped with the offset, while when they
+// become readable still follows the clock.
+func WithClockOffset(d time.Duration) Option { return func(s *Server) { s.clockOffset = d } }
+
 // WithLag delays every event's visibility to the audit-log API.
 func WithLag(d time.Duration) Option { return func(s *Server) { s.lag = d } }
 
@@ -55,6 +69,24 @@ func WithLagByType(action string, d time.Duration) Option {
 
 // WithDrop makes the org never log an action (a platform coverage gap).
 func WithDrop(action string) Option { return func(s *Server) { s.drop[action] = true } }
+
+// WithRecordedUserAgent makes the audit log record record(ua) as an event's
+// user_agent instead of the request's User-Agent, to model an org that drops
+// it (return "") or truncates it.
+func WithRecordedUserAgent(record func(ua string) string) Option {
+	return func(s *Server) { s.recordUA = record }
+}
+
+// WithoutHashedToken makes the audit log record no hashed_token, to model an
+// event shape that does not identify the credential.
+func WithoutHashedToken() Option { return func(s *Server) { s.hashToken = false } }
+
+// HashedToken is the hashed_token GitHub records for a request made with
+// token: the base64-encoded SHA-256 of the token.
+func HashedToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
 
 // WithMember seeds an extra organization member with role "member".
 func WithMember(login string) Option {
@@ -84,6 +116,8 @@ func New(opts ...Option) *Server {
 		now:       time.Now,
 		lagByType: map[string]time.Duration{},
 		drop:      map[string]bool{},
+		recordUA:  func(ua string) string { return ua },
+		hashToken: true,
 	}
 	for _, o := range opts {
 		o(s)

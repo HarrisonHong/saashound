@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 // Prefix is the reserved run-marker prefix. Every object the tool creates is
@@ -32,7 +33,16 @@ var (
 	// objectNameRe is the strict grammar of a run-created object name. The
 	// sweeper only ever considers names that match it exactly.
 	objectNameRe = regexp.MustCompile(`^` + Prefix + `-([` + runIDAlphabet + `]{6})-([a-z][a-z0-9]*(?:-[a-z0-9]+)*)$`)
-	uaRe         = regexp.MustCompile(`(?:^|\s)` + Prefix + `/(\S+) \(run=([` + runIDAlphabet + `]{6}); phase=([a-z]+)\)`)
+	// embeddedNameRe finds a run-object name inside a longer value, such as
+	// a login with its domain or a repository with its owner. The name must
+	// start at a word boundary; FindObjectNames checks the end.
+	embeddedNameRe = regexp.MustCompile(`(?:^|[^A-Za-z0-9_-])(` + Prefix + `-[` + runIDAlphabet + `]{6}-[a-z][a-z0-9]*(?:-[a-z0-9]+)*)`)
+	uaRe           = regexp.MustCompile(`(?:^|\s)` + Prefix + `/(\S+) \(run=([` + runIDAlphabet + `]{6}); phase=([a-z]+)\)`)
+	// uaProductRe recognises this tool's product token, so a User-Agent the
+	// platform truncated can still be told apart from another client's.
+	uaProductRe = regexp.MustCompile(`(?:^|\s)` + Prefix + `/`)
+	// uaRunRe recovers a complete run ID from what is left of a marker.
+	uaRunRe = regexp.MustCompile(`\(run=([` + runIDAlphabet + `]{6})(?:[;)\s]|$)`)
 )
 
 // MaxStepIDLength bounds step IDs so derived object names stay short enough
@@ -80,6 +90,30 @@ func ParseObjectName(name string) (run, step string, ok bool) {
 		return "", "", false
 	}
 	return m[1], m[2], true
+}
+
+// FindObjectNames returns every run-created object name embedded in s, in
+// order: a value a platform recorded for an object may decorate its name, as
+// a login carries a domain ("saashound-k3v9q2-victim@lab.example.com") or a
+// repository its owner ("acme/saashound-k3v9q2-repo"). Each name must be
+// whole: bounded on both sides by something that cannot be part of a name,
+// and matching ParseObjectName exactly.
+func FindObjectNames(s string) []string {
+	var out []string
+	for _, m := range embeddedNameRe.FindAllStringSubmatchIndex(s, -1) {
+		start, end := m[2], m[3]
+		if end < len(s) && isNameByte(s[end]) {
+			continue // runs on into more name characters: not a whole name
+		}
+		if _, _, ok := ParseObjectName(s[start:end]); ok {
+			out = append(out, s[start:end])
+		}
+	}
+	return out
+}
+
+func isNameByte(b byte) bool {
+	return b == '-' || b == '_' || ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') || ('0' <= b && b <= '9')
 }
 
 // Phase says which part of a run a request belongs to. It is carried in the
@@ -133,6 +167,43 @@ func ParseUserAgent(ua string) (ParsedUA, bool) {
 		return ParsedUA{}, false
 	}
 	return ParsedUA{Version: m[1], Run: m[2], Phase: p}, true
+}
+
+// RecordedUA classifies the User-Agent a platform recorded for a request.
+type RecordedUA int
+
+// What a platform can record for a request's User-Agent.
+const (
+	// UAMarker: the whole marker survived; ParseUserAgent reads it.
+	UAMarker RecordedUA = iota
+	// UAAbsent: the platform recorded no User-Agent.
+	UAAbsent
+	// UADamaged: this tool's product token survived but the rest of the
+	// marker did not, as when the platform truncates the field.
+	UADamaged
+	// UAForeign: another client's User-Agent.
+	UAForeign
+)
+
+// InspectUserAgent classifies a recorded User-Agent and returns whatever
+// marker it carries. For UAMarker the result is ParseUserAgent's. For
+// UADamaged only Run may be set, and only when a whole run ID survived, so a
+// truncated marker of another run is still recognised as another run's.
+func InspectUserAgent(ua string) (ParsedUA, RecordedUA) {
+	if p, ok := ParseUserAgent(ua); ok {
+		return p, UAMarker
+	}
+	switch {
+	case strings.TrimSpace(ua) == "":
+		return ParsedUA{}, UAAbsent
+	case uaProductRe.MatchString(ua):
+		var p ParsedUA
+		if m := uaRunRe.FindStringSubmatch(ua); m != nil {
+			p.Run = m[1]
+		}
+		return p, UADamaged
+	}
+	return ParsedUA{}, UAForeign
 }
 
 // AuthorizationName is the name of the object a human admin creates in the

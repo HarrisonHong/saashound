@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/HarrisonHong/saashound/internal/conformance"
+	"github.com/HarrisonHong/saashound/internal/marker"
 	"github.com/HarrisonHong/saashound/internal/provider"
 	"github.com/HarrisonHong/saashound/internal/secret"
 	"github.com/HarrisonHong/saashound/providers/github"
@@ -144,5 +146,54 @@ func TestWrongTokenIsRejected(t *testing.T) {
 	ten := open(t, cfg)
 	if _, err := ten.Whoami(context.Background()); err == nil || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("wrong token = %v; want 401", err)
+	}
+}
+
+// TestAuditEventsCarryCorrelationSignals: the audit source reports each
+// event's repository names and hashed_token, and its own credential as GitHub
+// records it (the base64 SHA-256 of the token, which `echo -n $TOKEN |
+// openssl dgst -sha256 -binary | base64` reproduces), so the collector can
+// correlate an event whose User-Agent GitHub did not record.
+func TestAuditEventsCarryCorrelationSignals(t *testing.T) {
+	const wantHash = "IfvLP7DVl4iOKwChr3EZBXzz210x6WAiLsGsDRRS0Qc=" // of testToken
+	ctx := context.Background()
+	_, cfg := newMock(t, mockgithub.WithRecordedUserAgent(func(string) string { return "" }))
+	ten := open(t, cfg)
+	src := ten.AuditSource()
+	cr, ok := src.(provider.CredentialRecorder)
+	if !ok {
+		t.Fatal("the github audit source does not report the credential it records")
+	}
+	if got := cr.RecordedCredential(); got != wantHash || got != mockgithub.HashedToken(testToken) {
+		t.Fatalf("RecordedCredential() = %q, want %q", got, wantHash)
+	}
+
+	run := "k3v9q2"
+	reg := provider.NewRegistry()
+	if err := reg.Register(github.New()); err != nil {
+		t.Fatal(err)
+	}
+	repo, _ := reg.Op("github.repo.create")
+	call := &provider.Call{Run: run, Step: "repo", Name: marker.ObjectName(run, "repo"), Params: map[string]string{}, Target: cfg.Target, Tenant: ten}
+	dctx := provider.WithUserAgent(ctx, marker.UserAgent("t", run, marker.PhaseDetonate))
+	if _, err := repo.Op.Do(dctx, call); err != nil {
+		t.Fatal(err)
+	}
+	evs, err := src.Poll(ctx, provider.AuditQuery{Since: time.Now().Add(-time.Hour), Until: time.Now().Add(time.Hour)})
+	if err != nil || len(evs) != 1 {
+		t.Fatalf("poll = %d events, %v; want the repo.create event", len(evs), err)
+	}
+	ev := evs[0]
+	if ev.Type != "repo.create" || ev.UserAgent != "" || ev.Credential != wantHash || ev.Time.IsZero() {
+		t.Fatalf("event = %+v", ev)
+	}
+	if len(ev.Objects) != 1 || ev.Objects[0] != testOrg+"/"+call.Name {
+		t.Fatalf("Objects = %q, want the run's repository", ev.Objects)
+	}
+	if err := ten.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cr.RecordedCredential(); got != "" {
+		t.Fatalf("RecordedCredential() after Close = %q; the token is gone, so nothing can match it", got)
 	}
 }

@@ -77,3 +77,91 @@ func TestRunDirsAndStates(t *testing.T) {
 	}
 	_ = l1.Unlock()
 }
+
+// TestPreviousLastMutation: the previous run's last mutation is the latest
+// step or undo record, not after this run's start, of the other runs in the
+// state directory on that target.
+func TestPreviousLastMutation(t *testing.T) {
+	d := Dir{Root: t.TempDir()}
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	if got := d.PreviousLastMutation("k3v9q2", "lab", t0); !got.IsZero() {
+		t.Fatalf("no state directory yet: %v, want zero", got)
+	}
+	// write journals a run on target: its header at the first time, then one
+	// record of each kind at each following time, and a complete phase
+	// record at done.
+	write := func(run, target string, done time.Time, kinds []journal.Kind, at ...time.Time) {
+		t.Helper()
+		if _, err := d.CreateRun(run); err != nil {
+			t.Fatal(err)
+		}
+		clk := clock.NewFake(at[0])
+		jp, _ := d.File(run, JournalFile)
+		w, err := journal.Create(jp, journal.Header{Run: run, Target: target, Technique: "fake.persistence.x"}, clk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		add := func(ts time.Time, r journal.Record) {
+			clk.Advance(ts.Sub(clk.Now()))
+			if err := w.Append(r); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i, k := range kinds {
+			add(at[i+1], journal.Record{Kind: k, Step: "a"})
+		}
+		add(done, journal.Record{Kind: journal.KindPhase, Phase: journal.PhaseComplete})
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	step := []journal.Kind{journal.KindIntent, journal.KindResult, journal.KindUndo, journal.KindGone}
+	const this = "k3v9q2"
+	start := t0.Add(time.Hour)
+	write(this, "lab", start.Add(time.Minute), step, start, start, start, start, start)
+	if got := d.PreviousLastMutation(this, "lab", start); !got.IsZero() {
+		t.Fatalf("only this run itself: %v, want zero", got)
+	}
+
+	// The run before: its undo is its last mutation; the check that the
+	// object is gone and the complete record, written after collection just
+	// before this run starts, are not.
+	undone := start.Add(-30 * time.Second)
+	write("x4b8nd", "lab", start.Add(-time.Millisecond), step,
+		t0.Add(20*time.Minute), t0.Add(21*time.Minute), t0.Add(22*time.Minute), undone, undone.Add(time.Second))
+	write("p7m2xw", "lab", t0.Add(10*time.Minute), step, t0, t0, t0, t0.Add(time.Minute), t0.Add(time.Minute))
+	// Later than x4b8nd's undo, but none of them the previous run's last
+	// mutation: another target, a run that never started a step, a run that
+	// mutated only after this one started, and a journal that cannot be read.
+	write("m9nq4z", "other", start, []journal.Kind{journal.KindIntent, journal.KindError}, t0, start.Add(-2*time.Second), start.Add(-time.Second))
+	write("r5tw8c", "lab", start.Add(-2*time.Second), nil, t0)
+	write("h2jk6e", "lab", start.Add(time.Minute), []journal.Kind{journal.KindIntent}, start.Add(-10*time.Second), start.Add(time.Second))
+	if _, err := d.CreateRun("q8wd3f"); err != nil {
+		t.Fatal(err)
+	}
+	jp, _ := d.File("q8wd3f", JournalFile)
+	if err := os.WriteFile(jp, []byte("not a journal\nat all\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.CreateRun("w6yz2a"); err != nil { // planned, never journalled
+		t.Fatal(err)
+	}
+
+	if got := d.PreviousLastMutation(this, "lab", start); !got.Equal(undone) {
+		t.Fatalf("PreviousLastMutation = %v, want the previous run's undo, %v", got, undone)
+	}
+	// A mutation exactly when this run started still went before it, and a
+	// run that straddles the start counts up to it.
+	if got := d.PreviousLastMutation(this, "lab", undone); !got.Equal(undone) {
+		t.Fatalf("PreviousLastMutation at the boundary = %v, want %v", got, undone)
+	}
+	if got := d.PreviousLastMutation(this, "lab", undone.Add(-time.Second)); !got.Equal(t0.Add(22 * time.Minute)) {
+		t.Fatalf("PreviousLastMutation before the undo = %v, want the step's result", got)
+	}
+	if got := d.PreviousLastMutation(this, "other", start); !got.Equal(start.Add(-time.Second)) {
+		t.Fatalf("PreviousLastMutation on the other target = %v, want its error record", got)
+	}
+	if got := d.PreviousLastMutation(this, "nowhere", start); !got.IsZero() {
+		t.Fatalf("a target with no runs: %v, want zero", got)
+	}
+}

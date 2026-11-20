@@ -306,6 +306,34 @@ func TestGoldenFailures(t *testing.T) {
 	}
 }
 
+// TestGoldenDegraded pins the records of passing runs on a platform whose
+// audit log does not keep the User-Agent whole: dropped for the first run,
+// truncated for the second. Their events are matched by the run's object
+// names inside the run window, and each expectation says so.
+func TestGoldenDegraded(t *testing.T) {
+	s := newSandbox(t)
+	s.initLab()
+	tp := filepath.Join(s.dir, "config", "targets.yaml")
+	b, _ := os.ReadFile(tp)
+	var out string
+	for _, c := range []struct{ run, technique, recording string }{
+		{"q8vz3k", "fake.persistence.mfa-factor-register", "dropped"},
+		{"w2hn5c", "fake.privilege-escalation.admin-role-assign", "truncated"},
+	} {
+		with := strings.Replace(string(b), "    test_domain: lab.example.com\n", "    test_domain: lab.example.com\n    options:\n      audit_user_agent: "+c.recording+"\n", 1)
+		if err := os.WriteFile(tp, []byte(with), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s.runIDs = []string{c.run}
+		r := s.run("apply", c.technique, "--target", "lab", "--yes", "-q")
+		if r.code != report.ExitOK {
+			t.Fatalf("%s with the User-Agent %s: exit %d\n%s", c.technique, c.recording, r.code, r.stdout)
+		}
+		out += r.stdout
+	}
+	golden(t, "apply-degraded.jsonl", out)
+}
+
 // TestResultSchemaIsDocumented requires every key of the result record to
 // appear in docs/result-schema.md.
 func TestResultSchemaIsDocumented(t *testing.T) {
@@ -314,7 +342,7 @@ func TestResultSchemaIsDocumented(t *testing.T) {
 		t.Fatal(err)
 	}
 	keys := map[string]bool{}
-	for _, name := range []string{"apply-pass.jsonl", "apply-failures.jsonl"} {
+	for _, name := range []string{"apply-pass.jsonl", "apply-failures.jsonl", "apply-degraded.jsonl"} {
 		b, err := os.ReadFile(filepath.Join("testdata", "golden", name))
 		if err != nil {
 			t.Fatal(err)
@@ -400,7 +428,7 @@ func TestSavedPlan(t *testing.T) {
 
 func TestCommands(t *testing.T) {
 	s := newSandbox(t)
-	if r := s.mustRun("version"); !strings.Contains(r.stdout, "result schema saashound.result/v1") {
+	if r := s.mustRun("version"); !strings.Contains(r.stdout, "result schema saashound.result/v2") {
 		t.Fatal(r.stdout)
 	}
 	r := s.mustRun("list")

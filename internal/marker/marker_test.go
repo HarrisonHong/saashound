@@ -86,6 +86,73 @@ func TestUserAgentRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFindObjectNames(t *testing.T) {
+	cases := map[string][]string{
+		Prefix + "-k3v9q2-victim":                                   {Prefix + "-k3v9q2-victim"},
+		Prefix + "-k3v9q2-victim@lab.example.com":                   {Prefix + "-k3v9q2-victim"},
+		"acme-labs/" + Prefix + "-k3v9q2-repo":                      {Prefix + "-k3v9q2-repo"},
+		"https://" + Prefix + "-k3v9q2-hook.invalid/x":              {Prefix + "-k3v9q2-hook"},
+		"Victim (" + Prefix + "-k3v9q2-a), " + Prefix + "-p7m2xw-b": {Prefix + "-k3v9q2-a", Prefix + "-p7m2xw-b"},
+		Prefix + "-k3v9q2-a/" + Prefix + "-p7m2xw-b":                {Prefix + "-k3v9q2-a", Prefix + "-p7m2xw-b"},
+		// Not whole names, or not names at all.
+		"":                              nil,
+		"Victim (k3v9q2)":               nil,
+		AuthorizationName:               nil,
+		Prefix + "-k3v9q2":              nil,
+		Prefix + "-k3v9q2-":             nil,
+		Prefix + "-K3V9Q2-victim":       nil,
+		"x" + Prefix + "-k3v9q2-victim": nil,
+		"X" + Prefix + "-k3v9q2-victim": nil,
+		"_" + Prefix + "-k3v9q2-victim": nil,
+		Prefix + "-k3v9q2-victim-":      nil,
+		Prefix + "-k3v9q2-victimX":      nil,
+		Prefix + "-k3v9q2-victim_old":   nil,
+		Prefix + "-k3v9q2x-victim":      nil,
+		Prefix + "-k3v9q-victim":        nil,
+		Prefix + "-k3v9q2-" + strings.Repeat("a", MaxStepIDLength+1): nil,
+	}
+	for in, want := range cases {
+		got := FindObjectNames(in)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("FindObjectNames(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestInspectUserAgent(t *testing.T) {
+	full := UserAgent("0.1.0", "k3v9q2", PhaseDetonate)
+	cases := []struct {
+		ua   string
+		want RecordedUA
+		run  string
+	}{
+		{full, UAMarker, "k3v9q2"},
+		{"proxy/1 " + full, UAMarker, "k3v9q2"},
+		{"", UAAbsent, ""},
+		{"  \t", UAAbsent, ""},
+		{full[:len(full)-1], UADamaged, "k3v9q2"},                 // lost the closing parenthesis
+		{"saashound/0.1.0 (run=k3v9q2; pha", UADamaged, "k3v9q2"}, // truncated in the phase
+		{"saashound/0.1.0 (run=k3v9q2", UADamaged, "k3v9q2"},      // truncated right after the run
+		{"saashound/0.1.0 (run=k3v9", UADamaged, ""},              // the run ID itself is cut
+		{"saashound/0.1.0 (ru", UADamaged, ""},
+		{"saashound/", UADamaged, ""},
+		{"saashound/0.1.0 (run=k3v9q2; phase=exfiltrate)", UADamaged, "k3v9q2"},
+		{"Mozilla/5.0 (X11; Linux x86_64)", UAForeign, ""},
+		{"notsaashound/0.1.0 (run=k3v9q2; phase=detonate)", UAForeign, ""},
+		{"saashound", UAForeign, ""}, // no product token
+		{"curl/8.4.0 (run=k3v9q2)", UAForeign, ""},
+	}
+	for _, c := range cases {
+		p, got := InspectUserAgent(c.ua)
+		if got != c.want || p.Run != c.run {
+			t.Errorf("InspectUserAgent(%q) = %+v, %d; want kind %d run %q", c.ua, p, got, c.want, c.run)
+		}
+		if got != UAMarker && p.Phase != "" {
+			t.Errorf("InspectUserAgent(%q) recovered phase %q from an incomplete marker", c.ua, p.Phase)
+		}
+	}
+}
+
 func TestFingerprint(t *testing.T) {
 	a := Fingerprint("lab", "okta", "org", "app", "lab")
 	if len(a) != 12 {

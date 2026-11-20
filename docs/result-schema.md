@@ -1,4 +1,4 @@
-# Result record: `saashound.result` version 1
+# Result record: `saashound.result` version 2
 
 `saashound apply` writes one JSON object per technique run to stdout when stdout is not a terminal (or always, with `--jsonl`). The same record is saved as `result.json` in the run's state directory. On a terminal, stdout shows the table view instead; progress always goes to stderr.
 
@@ -9,6 +9,11 @@ This document is the contract. `internal/cli/testdata/golden/*.jsonl` pins the e
 - `schema` and `version` identify the record. `version` changes only on a breaking change: a key removed, renamed, or given a different meaning or type.
 - Adding a key, or a new value to an enumerated field, is not breaking. Consumers must ignore keys they do not know and treat an unknown enumerated value as "not pass".
 - Keys use `snake_case`. Times are RFC 3339 in UTC. Durations are seconds, as numbers, with a `_s` suffix.
+
+Version history:
+
+- `2`: an expectation can be met by an event correlated without its User-Agent (see [Correlation](#correlation)), so `observed` no longer implies the platform recorded the run's marker. `telemetry.expectations[].correlation` says how each matching event was attributed to the run.
+- `1`: the first published record.
 
 ## Exit codes
 
@@ -24,7 +29,7 @@ This document is the contract. `internal/cli/testdata/golden/*.jsonl` pins the e
 | Key | Type | Meaning |
 |---|---|---|
 | `schema` | string | Always `"saashound.result"`. |
-| `version` | integer | Record version, `1`. |
+| `version` | integer | Record version, `2`. |
 | `run` | string | Run ID (six characters). Every object the run created is named `saashound-<run>-<step>`, and every request carried `saashound/<version> (run=<run>; phase=<phase>)` as its User-Agent. The phases are `preflight` (read-only guardrail and plan calls), `detonate`, `cleanup`, `collect` (the audit-log reads made after cleanup) and `sweep`. |
 | `technique` | string | Technique ID, `<platform>.<tactic>.<verb-object>`. |
 | `corpus` | string | `"verified"` for the corpus embedded in the binary, `"unverified"` for one loaded with `--corpus-dir`. |
@@ -69,7 +74,7 @@ This document is the contract. `internal/cli/testdata/golden/*.jsonl` pins the e
 
 ## `telemetry`
 
-Telemetry is collected after cleanup, from the platform's own audit log, keeping only events whose recorded User-Agent carries this run's ID. Expectations match detonation-phase events only. The collector's own reads carry the run's User-Agent with `phase=collect`. Collection stops once every expectation is resolved, or after a short bounded drain when a referenced detection rule has not fired yet (see [`detections`](#detections)).
+Telemetry is collected after cleanup, from the platform's own audit log, keeping only the events it can attribute to this run (see [Correlation](#correlation)). Expectations match detonation-phase events only. The collector's own reads carry the run's User-Agent with `phase=collect`. Collection stops once every expectation is resolved, or after a short bounded drain when a referenced detection rule has not fired yet (see [`detections`](#detections)).
 
 An expectation is only ever met by an event that was actually read. If collection could not start, failed or was interrupted (Ctrl-C), the expectations it did not resolve are `not-run`, `telemetry.error` says why, and the verdict is `telemetry-missing`, never `pass`.
 
@@ -92,6 +97,24 @@ An expectation is only ever met by an event that was actually read. If collectio
 | `telemetry.expectations[].deadline_s` | number | The deadline, measured from the step's completion. |
 | `telemetry.expectations[].latency_s` | number or null | Time from the step completing to the event first being read from the audit API. Because collection starts after cleanup, this is an upper bound on the platform's logging delay, and it can exceed the deadline of an `observed` expectation whose event the platform stamped in time. |
 | `telemetry.expectations[].event_id` | string | The matching event's ID. Omitted when not seen. |
+| `telemetry.expectations[].correlation` | string | How the matching event was attributed to this run: `user-agent` (its recorded User-Agent carries the run's marker), `name-prefix` (the platform did not record the User-Agent whole, and the event names one of the run's `saashound-<run>-<step>` objects) or `hashed-token` (the platform did not record the User-Agent whole, and it recorded the run's own credential for the request: GitHub's `hashed_token`). Anything but `user-agent` is a degraded match; see [Correlation](#correlation). Omitted when not seen. |
+
+### Correlation
+
+An event belongs to the run when one of these holds, and never otherwise:
+
+1. **`user-agent`**: the User-Agent the platform recorded carries this run's marker, `saashound/<version> (run=<run>; phase=<phase>)`. The marker also says which phase made the request. A marker naming another run rules the event out, whatever else it carries.
+2. **`name-prefix`** or **`hashed-token`**: the platform recorded no User-Agent, or only a truncated piece of the marker that names no other run, and the event carries another signal specific to this run: one of the run's object names in the fields where the platform names the objects an event acted on (an Okta target's `displayName` or `alternateId`, a GitHub event's `repo` or `repository`), or, on GitHub, the `hashed_token` of the token this run authenticated with (the base64-encoded SHA-256 of the token).
+
+Every correlation is bounded by the run window: from the run's first mutation (its first journalled intent) to the end of cleanup, widened by one minute on each side for clock differences between this machine and the platform. An event the platform stamped outside it is not the run's, whatever it carries; an event correlated by `name-prefix` or `hashed-token` must also have a platform timestamp to place in it. The window is never a signal on its own: an event with nothing specific to this run is never attributed to it because of when it happened.
+
+The fallback never attributes an event the platform recorded with another client's User-Agent (a person in the admin console, the platform itself, another tool, even one using this run's credential), an event that names another run's object, or an event whose remaining piece of marker names another run.
+
+A `name-prefix` or `hashed-token` match carries no marker to say which phase made it, so the phase is read off the platform's timestamp: more than the one-minute tolerance before the end of detonation it is detonation, more than the tolerance after it cleanup. In between, a cleanup call cannot be told from the last detonation call by time alone, and the event is assumed to be detonation so it can still meet the expectation of the step that caused it (`-vv` says which events were assumed). An expectation takes the earliest matching event on the platform's clock, and a step's own event comes before the one its undo causes. Two consequences of a degraded match: if the platform lost the step's own event but logged the matching event its undo caused (an event of the same type), the expectation is met by the undo's event; and the detection checkers see the run's early cleanup events among its detonation-phase events. `correlation` makes every such match visible, and `-v` and the progress line report how many events were matched without the User-Agent. A platform's coverage gap drops an event type, not one event, so it still shows as `missing`.
+
+`hashed-token` has a tighter lower edge than the rest of the window. Consecutive runs on one target authenticate with the same credential, and the one-minute tolerance before a run's first mutation reaches back into the run before it, so the credential alone cannot tell the two runs' events apart there; and the platform's clock may lead or lag this machine's, so neither run's own times can serve as the boundary. An event whose only signal is `hashed-token` must therefore be stamped after the midpoint between the previous run's last mutation on the same target (the last step or undo record of that run's journal in the local state directory, not the records written after its telemetry was collected) and this run's first mutation. One stamped at or before the midpoint is closer to the previous run than to this one: it is not correlated, and `-vv` explains it. This leaves half the gap between the two runs as clock tolerance each way: a platform clock that leads by less than that cannot carry the previous run's events into this run, and one that lags by less than that cannot push this run's events out. Beyond it, an event is left uncorrelated (`missing`) or attributed to the neighbouring run. The gap is the time the previous run spent proving its cleanup and collecting its telemetry, plus whatever passed before this run began, so the tolerance is small when two runs follow each other quickly; once the gap exceeds two minutes the midpoint lies outside the window, and the edge is the window's own, one minute before the first mutation. The first run on a target has no such edge. `name-prefix` and the User-Agent marker name the run itself and keep the whole window.
+
+The midpoint rule only knows the runs recorded in the local state directory. The per-target lock keeps one run per target at a time on one machine and one state directory, so those runs never overlap, but a run against the same tenant with the same credential from another machine, another state directory or another target entry is not known here: an event of such a run that carries only `hashed_token` (no User-Agent, no run object name) and is stamped inside this run's window can still be attributed to this run. The User-Agent marker and `name-prefix` stay safe in that case, because they name the run.
 
 ## `detections`
 

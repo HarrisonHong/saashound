@@ -8,6 +8,9 @@
 //     and only declared outputs;
 //   - every audit event Do and Undo emit carries the run's User-Agent with
 //     the right phase, and every declared event type is really emitted;
+//   - every such event can be attributed to the run even when the platform
+//     does not record the User-Agent: it names one of the run's objects, or
+//     carries the run's credential where the platform records one;
 //   - Locate finds a created object by its exact name and nothing else;
 //   - Sweep finds what the op created;
 //   - Undo then Gone proves the object gone (or the prior value restored);
@@ -172,6 +175,8 @@ func runOp(t *testing.T, h Harness, reg *provider.Registry, e *provider.Entry) {
 	}
 
 	checkEvents(t, ctx, tenant, run, start, marker.PhaseDetonate, e.Spec.Events, "Do")
+	touchesRunObject := e.Spec.Kind == provider.KindCreate || len(deps) > 0
+	checkCorrelatable(t, ctx, tenant, run, start, marker.PhaseDetonate, touchesRunObject, "Do")
 
 	if err := e.Undo.Undo(cctx, call, rec); err != nil {
 		t.Fatalf("Undo: %v", err)
@@ -191,6 +196,7 @@ func runOp(t *testing.T, h Harness, reg *provider.Registry, e *provider.Entry) {
 		}
 	}
 	checkEvents(t, ctx, tenant, run, start, marker.PhaseCleanup, e.Spec.UndoEvents, "Undo")
+	checkCorrelatable(t, ctx, tenant, run, start, marker.PhaseCleanup, touchesRunObject, "Undo")
 
 	for i := len(deps) - 1; i >= 0; i-- {
 		d := deps[i]
@@ -285,6 +291,49 @@ func checkEvents(t *testing.T, ctx context.Context, tenant provider.Tenant, run 
 	sort.Strings(missing)
 	if len(missing) > 0 {
 		t.Errorf("%s: declared events %v were not logged with User-Agent run=%s phase=%s (logged: %v)", what, missing, run, phase, keys(got))
+	}
+}
+
+// checkCorrelatable requires every event the run caused in phase to carry a
+// correlation signal besides its User-Agent, so the collector can still
+// attribute it to the run on a platform that does not record the User-Agent:
+// one of the run's object names in Event.Objects, or the run's credential in
+// Event.Credential. An op that touches nothing the run created can only be
+// recognised by its credential; on a platform that records none, its events
+// are attributable by the User-Agent alone and the check does not apply.
+func checkCorrelatable(t *testing.T, ctx context.Context, tenant provider.Tenant, run string, since time.Time, phase marker.Phase, touchesRunObject bool, what string) {
+	t.Helper()
+	src := tenant.AuditSource()
+	cred := ""
+	if cr, ok := src.(provider.CredentialRecorder); ok {
+		cred = cr.RecordedCredential()
+	}
+	if !touchesRunObject && cred == "" {
+		return
+	}
+	evs, err := src.Poll(ctx, provider.AuditQuery{Since: since, Until: time.Now().Add(time.Minute), Run: run})
+	if err != nil {
+		t.Fatalf("audit poll: %v", err)
+	}
+	for _, ev := range evs {
+		ua, ok := marker.ParseUserAgent(ev.UserAgent)
+		if !ok || ua.Run != run || ua.Phase != phase {
+			continue
+		}
+		if cred != "" && ev.Credential == cred {
+			continue
+		}
+		named := false
+		for _, v := range ev.Objects {
+			for _, name := range marker.FindObjectNames(v) {
+				if r, _, _ := marker.ParseObjectName(name); r == run {
+					named = true
+				}
+			}
+		}
+		if !named {
+			t.Errorf("%s: event %s %s names none of run %s's objects (Objects %q) and carries no credential the platform records for this run, so without its User-Agent it could not be attributed to the run", what, ev.ID, ev.Type, run, ev.Objects)
+		}
 	}
 }
 

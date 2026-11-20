@@ -380,6 +380,53 @@ func (j *Journal) LastPhase() string {
 	return p[len(p)-1]
 }
 
+// Span is when, by this machine's clock, the run could have changed the
+// tenant: from its first intent to the journal's last record.
+type Span struct {
+	// Start is the first intent. No op runs before its intent is durable,
+	// so nothing the run did can precede it.
+	Start time.Time
+	// DetonateEnd is the last detonation record (an intent, result or error,
+	// or the detonation's phase record). Every detonation call had returned
+	// by then; cleanup calls come after it.
+	DetonateEnd time.Time
+	// End is the last record. Read after cleanup, every cleanup call had
+	// returned by then.
+	End time.Time
+}
+
+// Span returns the run's span. It returns false when no step was ever
+// started, so the run cannot have changed anything.
+func (j *Journal) Span() (Span, bool) {
+	var sp Span
+	later := func(t *time.Time, ts time.Time) {
+		if ts.After(*t) {
+			*t = ts
+		}
+	}
+	for _, r := range j.Records {
+		switch r.Kind {
+		case KindIntent:
+			if sp.Start.IsZero() || r.Time.Before(sp.Start) {
+				sp.Start = r.Time
+			}
+			later(&sp.DetonateEnd, r.Time)
+		case KindResult, KindError:
+			later(&sp.DetonateEnd, r.Time)
+		case KindPhase:
+			switch r.Phase {
+			case PhaseDetonateDone, PhaseDetonateFailed, PhaseDetonateAborted:
+				later(&sp.DetonateEnd, r.Time)
+			}
+		}
+		later(&sp.End, r.Time)
+	}
+	if sp.Start.IsZero() {
+		return Span{}, false
+	}
+	return sp, true
+}
+
 // Pending returns the steps that were started and are not yet proven undone.
 func (j *Journal) Pending() []*StepState {
 	var out []*StepState

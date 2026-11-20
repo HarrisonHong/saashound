@@ -456,3 +456,338 @@ func TestCollectorDrainInterrupted(t *testing.T) {
 		})
 	}
 }
+
+// addEvent adds ev, readable from visible.
+func (s *source) addEvent(visible time.Time, ev provider.Event) {
+	s.events = append(s.events, timed{visible, ev})
+}
+
+// credSource is an audit source whose platform records the credential
+// behind each event, as GitHub's hashed_token does.
+type credSource struct {
+	*source
+	cred string
+}
+
+func (c credSource) RecordedCredential() string { return c.cred }
+
+// oktaEvent is an Okta-shaped event: what the platform recorded, with the
+// target ids the expectations match on and the target names the provider
+// reports as Objects.
+func oktaEvent(at time.Time, id, typ, ua, targetID string, names ...string) provider.Event {
+	targets := []map[string]string{{"id": targetID}}
+	for _, n := range names {
+		targets = append(targets, map[string]string{"id": "x", "alternateId": n})
+	}
+	raw, _ := json.Marshal(map[string]any{"uuid": id, "eventType": typ, "target": targets})
+	return provider.Event{ID: id, Time: at, Type: typ, UserAgent: ua, Objects: names, Raw: raw}
+}
+
+// githubEvent is a GitHub-shaped event: repo carries the owner and the name,
+// hashed_token the credential.
+func githubEvent(at time.Time, id, action, ua, repoID, repo, hashedToken string) provider.Event {
+	raw, _ := json.Marshal(map[string]any{"_document_id": id, "action": action, "repo": repo, "repo_id": repoID, "hashed_token": hashedToken})
+	ev := provider.Event{ID: id, Time: at, Type: action, UserAgent: ua, Credential: hashedToken, Raw: raw}
+	if repo != "" {
+		ev.Objects = []string{repo}
+	}
+	return ev
+}
+
+// runWindow is a run that mutated from t0+1s, ended detonation at t0+10s and
+// finished cleanup at t0+20s.
+func runWindow(t0 time.Time) Window {
+	return Window{Start: t0.Add(time.Second), DetonateEnd: t0.Add(10 * time.Second), End: t0.Add(20 * time.Second)}
+}
+
+// TestCollectorCorrelatesWithoutUserAgent: a platform that records no
+// User-Agent, or a truncated one, still yields the run's events, matched by
+// the run's object names inside the run window, with the phase read off the
+// platform's timestamp.
+func TestCollectorCorrelatesWithoutUserAgent(t *testing.T) {
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(t0.Add(25 * time.Second)) // collection starts after cleanup
+	src := &source{clk: clk}
+	run := "k3v9q2"
+	victim := marker.ObjectName(run, "victim") + "@lab.example.com"
+	truncated := marker.UserAgent("1", run, marker.PhaseDetonate)[:24]
+
+	src.addEvent(t0, oktaEvent(t0.Add(2*time.Second), "e1", "user.lifecycle.create", "", "u1", victim))
+	src.addEvent(t0, oktaEvent(t0.Add(4*time.Second), "e2", "user.mfa.factor.activate", truncated, "u1", victim))
+	// The cleanup's own events, after detonation ended plus the skew: cleanup
+	// phase, so they never satisfy an expectation.
+	src.addEvent(t0, oktaEvent(t0.Add(18*time.Second), "e3", "user.lifecycle.delete", "", "u1", victim))
+
+	exps := []Expectation{
+		{After: "victim", Type: "user.lifecycle.create", Match: map[string]string{"eventType": "user.lifecycle.create", "target[].id": "u1"}, Deadline: 30 * time.Second, ActionAt: t0.Add(2 * time.Second)},
+		{After: "factor", Type: "user.mfa.factor.activate", Match: map[string]string{"eventType": "user.mfa.factor.activate", "target[].id": "u1"}, Deadline: 30 * time.Second, ActionAt: t0.Add(4 * time.Second)},
+		{After: "victim", Type: "user.lifecycle.delete", Match: map[string]string{"eventType": "user.lifecycle.delete"}, Deadline: 30 * time.Second, ActionAt: t0.Add(2 * time.Second)},
+	}
+	c := &Collector{Source: src, Info: provider.AuditInfo{PollInterval: 5 * time.Second}, Clock: clk, Skew: 5 * time.Second, Window: runWindow(t0)}
+	res := c.Collect(context.Background(), run, t0, exps)
+
+	want := []struct {
+		status string
+		event  string
+		by     Signal
+	}{{StatusObserved, "e1", SignalNamePrefix}, {StatusObserved, "e2", SignalNamePrefix}, {StatusMissing, "", ""}}
+	for i, w := range want {
+		o := res.Outcomes[i]
+		if o.Status != w.status || o.EventID != w.event || o.Correlation != w.by {
+			t.Errorf("expect[%d] %s = %s by %q (%s); want %s by %q (%s)", i, o.Type, o.Status, o.Correlation, o.EventID, w.status, w.by, w.event)
+		}
+	}
+	phases := map[string]marker.Phase{}
+	for _, e := range res.Events {
+		phases[e.ID] = e.Phase
+		if e.Correlation != SignalNamePrefix {
+			t.Errorf("event %s correlated by %q, want name-prefix", e.ID, e.Correlation)
+		}
+	}
+	if len(phases) != 3 || phases["e1"] != marker.PhaseDetonate || phases["e2"] != marker.PhaseDetonate || phases["e3"] != marker.PhaseCleanup {
+		t.Errorf("kept events with phases %v; want e1, e2 detonate and e3 cleanup", phases)
+	}
+}
+
+// TestCollectorPrefersTheStepsOwnEvent: without a User-Agent, the event a
+// step caused and the event its undo caused can both match the step's
+// expectation and both lie within the skew of the end of detonation. The
+// step's own event is the earlier one on the platform's clock, and it wins
+// even when the audit API returns the undo's first.
+func TestCollectorPrefersTheStepsOwnEvent(t *testing.T) {
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(t0.Add(25 * time.Second))
+	src := &source{clk: clk}
+	run := "k3v9q2"
+	rule := marker.ObjectName(run, "rule")
+	src.addEvent(t0, oktaEvent(t0.Add(10*time.Second+50*time.Millisecond), "restore", "policy.rule.update", "", "r1", rule))
+	src.addEvent(t0, oktaEvent(t0.Add(9*time.Second), "weaken", "policy.rule.update", "", "r1", rule))
+	exps := []Expectation{{After: "weaken", Type: "policy.rule.update", Match: map[string]string{"eventType": "policy.rule.update", "target[].id": "r1"}, Deadline: 30 * time.Second, ActionAt: t0.Add(9 * time.Second)}}
+	c := &Collector{Source: src, Info: provider.AuditInfo{PollInterval: 5 * time.Second}, Clock: clk, Skew: 5 * time.Second, Window: runWindow(t0)}
+	res := c.Collect(context.Background(), run, t0, exps)
+	if o := res.Outcomes[0]; o.Status != StatusObserved || o.EventID != "weaken" {
+		t.Fatalf("outcome %+v; want observed by the step's own event", o)
+	}
+}
+
+// TestCollectorCorrelatesByHashedToken: on GitHub, an event that names no
+// run object (an org membership change) still correlates by the run's own
+// credential, and a repository event by the run's repository name.
+func TestCollectorCorrelatesByHashedToken(t *testing.T) {
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(t0.Add(25 * time.Second))
+	base := &source{clk: clk}
+	src := credSource{source: base, cred: "k1i0g7C2T0eMlSdYnfQTXlTj2p5j1/yPzVTqkn9KQ5w="}
+	run := "k3v9q2"
+	repo := "acme-labs/" + marker.ObjectName(run, "repo")
+	promote, _ := json.Marshal(map[string]any{"_document_id": "g1", "action": "org.update_member", "user": "octo-second", "hashed_token": src.cred})
+	base.addEvent(t0, provider.Event{ID: "g1", Time: t0.Add(3 * time.Second), Type: "org.update_member", Credential: src.cred, Raw: promote})
+	base.addEvent(t0, githubEvent(t0.Add(4*time.Second), "g2", "hook.create", "", "42", repo, ""))
+	exps := []Expectation{
+		{After: "promote", Type: "org.update_member", Match: map[string]string{"action": "org.update_member", "user": "octo-second"}, Deadline: time.Minute, ActionAt: t0.Add(3 * time.Second)},
+		{After: "hook", Type: "hook.create", Match: map[string]string{"action": "hook.create", "repo_id": "42"}, Deadline: time.Minute, ActionAt: t0.Add(4 * time.Second)},
+	}
+	c := &Collector{Source: src, Info: provider.AuditInfo{PollInterval: 5 * time.Second}, Clock: clk, Skew: 5 * time.Second, Window: runWindow(t0)}
+	res := c.Collect(context.Background(), run, t0, exps)
+	if o := res.Outcomes[0]; o.Status != StatusObserved || o.Correlation != SignalHashedToken {
+		t.Errorf("promote outcome %+v; want observed by hashed-token", o)
+	}
+	if o := res.Outcomes[1]; o.Status != StatusObserved || o.Correlation != SignalNamePrefix {
+		t.Errorf("hook outcome %+v; want observed by name-prefix", o)
+	}
+}
+
+// TestCollectorBoundsHashedTokenByThePreviousRun: consecutive runs on one
+// target share a credential, so an event whose only signal is the credential
+// must be stamped after the midpoint between the previous run's last
+// mutation and this run's first, which tolerates a platform clock leading or
+// lagging by less than half the gap. An event naming this run's object is
+// this run's wherever it falls in the window.
+func TestCollectorBoundsHashedTokenByThePreviousRun(t *testing.T) {
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	cred := "k1i0g7C2T0eMlSdYnfQTXlTj2p5j1/yPzVTqkn9KQ5w="
+	run := "k3v9q2"
+	skew := 5 * time.Second
+	member := func(at time.Time, id string) provider.Event {
+		raw, _ := json.Marshal(map[string]any{"_document_id": id, "action": "org.update_member", "user": "octo-second", "hashed_token": cred})
+		return provider.Event{ID: id, Time: at, Type: "org.update_member", Credential: cred, Raw: raw}
+	}
+	const nearer = " org.update_member not correlated: carries this run's credential but its User-Agent did not survive and it is stamped closer to the previous run on this target than to this one"
+	// collect runs the collector over evs and returns the signal each kept
+	// event was correlated by, the outcomes and the -vv trace.
+	collect := func(w Window, evs ...provider.Event) (map[string]Signal, []Outcome, string) {
+		clk := clock.NewFake(t0.Add(25 * time.Second))
+		base := &source{clk: clk}
+		for _, ev := range evs {
+			base.addEvent(t0, ev)
+		}
+		var traces []string
+		exps := []Expectation{
+			{After: "promote", Type: "org.update_member", Match: map[string]string{"action": "org.update_member", "user": "octo-second"}, Deadline: time.Minute, ActionAt: w.Start},
+			{After: "hook", Type: "hook.create", Match: map[string]string{"action": "hook.create", "repo_id": "42"}, Deadline: time.Minute, ActionAt: w.Start},
+		}
+		c := &Collector{Source: credSource{source: base, cred: cred}, Info: provider.AuditInfo{PollInterval: 5 * time.Second}, Clock: clk, Skew: skew, Window: w,
+			Trace: func(format string, a ...any) { traces = append(traces, fmt.Sprintf(format, a...)) }}
+		res := c.Collect(context.Background(), run, t0, exps)
+		kept := map[string]Signal{}
+		for _, e := range res.Events {
+			kept[e.ID] = e.Correlation
+		}
+		return kept, res.Outcomes, strings.Join(traces, "\n")
+	}
+
+	t.Run("inside the skew", func(t *testing.T) {
+		w := runWindow(t0)
+		w.PreviousMutation = w.Start.Add(-4 * time.Second)
+		mid := w.Start.Add(-2 * time.Second)
+		repo := "acme-labs/" + marker.ObjectName(run, "repo")
+		kept, outcomes, trace := collect(w,
+			member(w.PreviousMutation.Add(time.Second), "previous-clock-ahead"),
+			member(mid, "midpoint"),
+			member(w.Start.Add(-time.Second), "own-clock-behind"),
+			githubEvent(w.PreviousMutation.Add(time.Second), "named", "hook.create", "", "42", repo, cred))
+		if o := outcomes[0]; o.Status != StatusObserved || o.EventID != "own-clock-behind" || o.Correlation != SignalHashedToken {
+			t.Errorf("promote outcome %+v; want observed by the event stamped after the midpoint, by hashed-token", o)
+		}
+		if o := outcomes[1]; o.Status != StatusObserved || o.EventID != "named" || o.Correlation != SignalNamePrefix {
+			t.Errorf("hook outcome %+v; want observed by name-prefix though stamped before the midpoint", o)
+		}
+		if len(kept) != 2 || kept["own-clock-behind"] != SignalHashedToken || kept["named"] != SignalNamePrefix {
+			t.Errorf("kept events %v; want only own-clock-behind (hashed-token) and named (name-prefix)", kept)
+		}
+		for _, id := range []string{"previous-clock-ahead", "midpoint"} {
+			if n := strings.Count(trace, "event "+id+nearer); n != 1 {
+				t.Errorf("near miss %s traced %d times, want once:\n%s", id, n, trace)
+			}
+		}
+	})
+
+	t.Run("a gap of more than twice the skew", func(t *testing.T) {
+		w := runWindow(t0)
+		w.PreviousMutation = w.Start.Add(-2*skew - 2*time.Second) // the midpoint is one second outside the window
+		kept, outcomes, trace := collect(w,
+			member(w.Start.Add(-skew-time.Millisecond), "outside"),
+			member(w.Start.Add(-skew), "edge"))
+		if o := outcomes[0]; o.Status != StatusObserved || o.EventID != "edge" || o.Correlation != SignalHashedToken {
+			t.Errorf("promote outcome %+v; want observed by the event at the window's edge", o)
+		}
+		if len(kept) != 1 {
+			t.Errorf("kept events %v; want only edge", kept)
+		}
+		if !strings.Contains(trace, "event outside org.update_member not correlated: matches this run by hashed-token but its User-Agent did not survive and it is stamped outside the run window") {
+			t.Errorf("the event before the window is not ruled out by the window:\n%s", trace)
+		}
+	})
+
+	t.Run("no previous run", func(t *testing.T) {
+		w := runWindow(t0)
+		_, outcomes, _ := collect(w, member(w.Start.Add(-skew), "edge"), member(w.Start, "later"))
+		if o := outcomes[0]; o.Status != StatusObserved || o.EventID != "edge" {
+			t.Errorf("promote outcome %+v; want the earliest event in the window", o)
+		}
+	})
+}
+
+// TestCollectorNeverMisattributes: no event from another run, another
+// client, or outside the run window is ever the run's, and the window alone
+// never correlates anything. Every decoy below would satisfy the
+// expectation if it were attributed to the run.
+func TestCollectorNeverMisattributes(t *testing.T) {
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(t0.Add(25 * time.Second))
+	base := &source{clk: clk}
+	ours := "k3v9q2"
+	cred := "k1i0g7C2T0eMlSdYnfQTXlTj2p5j1/yPzVTqkn9KQ5w="
+	src := credSource{source: base, cred: cred}
+	ourName := marker.ObjectName(ours, "victim") + "@lab.example.com"
+	otherName := marker.ObjectName("p7m2xw", "victim") + "@lab.example.com"
+	inside := t0.Add(5 * time.Second)
+	skew := 5 * time.Second
+	w := runWindow(t0)
+
+	decoys := []struct {
+		why string
+		ev  provider.Event
+	}{
+		{"another run's object, no User-Agent", oktaEvent(inside, "d1", "x", "", "u1", otherName)},
+		{"another run's marker naming our object", oktaEvent(inside, "d2", "x", marker.UserAgent("1", "p7m2xw", marker.PhaseDetonate), "u1", ourName)},
+		{"a truncated marker of another run naming our object", oktaEvent(inside, "d3", "x", "saashound/1 (run=p7m2xw; pha", "u1", ourName)},
+		{"our object and another run's", oktaEvent(inside, "d4", "x", "", "u1", ourName, otherName)},
+		{"our object, recorded with a person's browser", oktaEvent(inside, "d5", "x", "Mozilla/5.0 (X11; Linux x86_64)", "u1", ourName)},
+		{"our object, recorded with another tool", oktaEvent(inside, "d6", "x", "terraform-provider-okta/4.0", "u1", ourName)},
+		{"our object, stamped before the run window", oktaEvent(w.Start.Add(-skew-time.Millisecond), "d7", "x", "", "u1", ourName)},
+		{"our object, stamped after the run window", oktaEvent(w.End.Add(skew+time.Millisecond), "d8", "x", "", "u1", ourName)},
+		{"our object, no platform timestamp", oktaEvent(time.Time{}, "d9", "x", "", "u1", ourName)},
+		{"inside the window, nothing run-specific", oktaEvent(inside, "d10", "x", "", "u1")},
+		{"inside the window, another credential", githubEvent(inside, "d11", "x", "", "u1", "", "c29tZW9uZSBlbHNlJ3MgdG9rZW4=")},
+		{"our credential, recorded with another tool", githubEvent(inside, "d12", "x", "gh/2.40.0", "u1", "", cred)},
+		{"our marker, stamped after the run window", oktaEvent(w.End.Add(skew+time.Second), "d13", "x", marker.UserAgent("1", ours, marker.PhaseDetonate), "u1", ourName)},
+		{"another run's repository, no User-Agent", githubEvent(inside, "d14", "x", "", "u1", "acme-labs/"+marker.ObjectName("p7m2xw", "repo"), "")},
+		{"another run's repository, our credential", githubEvent(inside, "d15", "x", "", "u1", "acme-labs/"+marker.ObjectName("p7m2xw", "repo"), cred)},
+		{"a name that only contains ours", oktaEvent(inside, "d16", "x", "", "u1", "x"+marker.ObjectName(ours, "victim"))},
+		{"a truncated marker of our run, nothing run-specific", oktaEvent(inside, "d17", "x", "saashound/1 (run="+ours+"; pha", "u1")},
+	}
+	for _, d := range decoys {
+		base.addEvent(t0, d.ev)
+	}
+	// The positive control: one genuine, UA-less event of this run.
+	base.addEvent(t0, oktaEvent(inside, "ok", "y", "", "u1", ourName))
+
+	var traces []string
+	exps := []Expectation{
+		{After: "a", Type: "x", Match: map[string]string{"eventType": "x", "target[].id": "u1"}, Deadline: 10 * time.Second, ActionAt: inside},
+		{After: "b", Type: "y", Match: map[string]string{"eventType": "y", "target[].id": "u1"}, Deadline: 10 * time.Second, ActionAt: inside},
+	}
+	c := &Collector{Source: src, Info: provider.AuditInfo{PollInterval: 5 * time.Second}, Clock: clk, Skew: skew, Window: w,
+		Trace: func(format string, a ...any) { traces = append(traces, fmt.Sprintf(format, a...)) }}
+	res := c.Collect(context.Background(), ours, t0, exps)
+
+	if o := res.Outcomes[0]; o.Status != StatusMissing || o.EventID != "" {
+		t.Errorf("a decoy satisfied the expectation: %+v", o)
+	}
+	if o := res.Outcomes[1]; o.Status != StatusObserved || o.EventID != "ok" {
+		t.Errorf("the genuine event did not: %+v", o)
+	}
+	for _, e := range res.Events {
+		if e.ID != "ok" {
+			for _, d := range decoys {
+				if d.ev.ID == e.ID {
+					t.Errorf("decoy %s (%s) was attributed to the run by %s", e.ID, d.why, e.Correlation)
+				}
+			}
+		}
+	}
+	// Near misses are explained once each at -vv; plain foreign events are not.
+	joined := strings.Join(traces, "\n")
+	for _, id := range []string{"d4", "d5", "d6", "d7", "d8", "d9", "d12", "d13", "d17"} {
+		if n := strings.Count(joined, "event "+id+" x not correlated"); n != 1 {
+			t.Errorf("near miss %s traced %d times, want once:\n%s", id, n, joined)
+		}
+	}
+	if !strings.Contains(joined, "event d9 x not correlated: matches this run by name-prefix but its User-Agent did not survive and it has no platform timestamp") {
+		t.Errorf("the near miss without a timestamp does not say so:\n%s", joined)
+	}
+	if !strings.Contains(joined, "event d17 x not correlated: carries a truncated User-Agent naming this run but no object name or credential to correlate it") {
+		t.Errorf("the near miss with only a truncated marker of this run does not say so:\n%s", joined)
+	}
+	for _, id := range []string{"d1", "d2", "d3", "d10", "d11", "d14", "d15", "d16"} {
+		if strings.Contains(joined, "event "+id+" ") {
+			t.Errorf("event %s carries nothing of this run's but was traced:\n%s", id, joined)
+		}
+	}
+}
+
+// TestCollectorWithoutWindowNeedsTheUserAgent: with no run window to bound
+// it, the fallback never correlates; only the marker does.
+func TestCollectorWithoutWindowNeedsTheUserAgent(t *testing.T) {
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(t0)
+	src := &source{clk: clk}
+	run := "k3v9q2"
+	src.addEvent(t0, oktaEvent(t0, "e1", "a", "", "u1", marker.ObjectName(run, "victim")))
+	c := &Collector{Source: src, Info: provider.AuditInfo{PollInterval: 5 * time.Second}, Clock: clk}
+	res := c.Collect(context.Background(), run, t0, []Expectation{{After: "a", Type: "a", Match: map[string]string{"eventType": "a"}, Deadline: 5 * time.Second, ActionAt: t0}})
+	if res.Outcomes[0].Status != StatusMissing || len(res.Events) != 0 {
+		t.Fatalf("outcome %+v, events %d; want nothing correlated without a window", res.Outcomes[0], len(res.Events))
+	}
+}

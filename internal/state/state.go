@@ -193,6 +193,46 @@ func (d Dir) Runs() ([]RunInfo, error) {
 	return out, nil
 }
 
+// PreviousLastMutation is when the run that went before run on the same
+// target last changed the tenant: among the other runs here whose journal
+// names target, the latest record of a call that can change the tenant (an
+// intent, result or error of a step, or an undo of its cleanup) that is not
+// after start, run's own first mutation. Phase records, such as the complete
+// record written after telemetry collection, are not mutations and never
+// count. The target lock keeps runs on one target from one state directory
+// from overlapping, so that is the run immediately before it. It is the zero
+// time when there is none; a run whose journal cannot be read, or that never
+// started a step, is skipped.
+func (d Dir) PreviousLastMutation(run, target string, start time.Time) time.Time {
+	entries, err := os.ReadDir(filepath.Join(d.Root, "runs"))
+	if err != nil {
+		return time.Time{}
+	}
+	var last time.Time
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == run || !marker.ValidRunID(e.Name()) {
+			continue
+		}
+		p, err := d.File(e.Name(), JournalFile)
+		if err != nil {
+			continue
+		}
+		j, err := journal.Load(p)
+		if err != nil || j.Header.Target != target {
+			continue
+		}
+		for _, r := range j.Records {
+			switch r.Kind {
+			case journal.KindIntent, journal.KindResult, journal.KindError, journal.KindUndo:
+				if !r.Time.After(start) && r.Time.After(last) {
+					last = r.Time
+				}
+			}
+		}
+	}
+	return last
+}
+
 // Info derives one run's state from its journal and its lock.
 func (d Dir) Info(run string) RunInfo {
 	info := RunInfo{Run: run}
